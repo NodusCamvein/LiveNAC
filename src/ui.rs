@@ -210,6 +210,8 @@ impl LiveNAC {
             _ => return,
         };
 
+        let mut send_action: Option<(String, bool)> = None;
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading(format!("Logged in as {}", user_login));
             ui.add_space(20.0);
@@ -307,9 +309,7 @@ impl LiveNAC {
                             if let Err(e) = ChatClient::validate_message(&message_for_send) {
                                 *last_error = Some(format!("Message validation failed: {}", e));
                             } else {
-                                // We need to call send_message outside this closure
-                                // Store the intent and handle it after the UI update
-                                self.send_message(message_for_send, false);
+                                send_action = Some((message_for_send, false));
                             }
                         }
                         
@@ -317,7 +317,7 @@ impl LiveNAC {
                             if let Err(e) = ChatClient::validate_message(&message_for_announcement) {
                                 *last_error = Some(format!("Message validation failed: {}", e));
                             } else {
-                                self.send_message(message_for_announcement, true);
+                                send_action = Some((message_for_announcement, true));
                             }
                         }
                     });
@@ -342,6 +342,10 @@ impl LiveNAC {
             ui.separator();
             ui.label(format!("Messages in chat: {}", chat_messages_len));
         });
+
+        if let Some((message, is_announcement)) = send_action {
+            self.send_message(message, is_announcement);
+        }
     }
 
     fn send_message(&mut self, message: String, is_announcement: bool) {

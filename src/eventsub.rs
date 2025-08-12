@@ -7,7 +7,7 @@ use tokio_tungstenite::connect_async;
 use twitch_api::eventsub::{
     channel::ChannelChatMessageV1,
     event::websocket::{EventsubWebsocketData, WelcomePayload},
-    Transport, Event,
+    Transport, Event, Message,
 };
 use twitch_api::helix::eventsub::{CreateEventSubSubscriptionBody, CreateEventSubSubscriptionRequest};
 use twitch_api::helix::users::GetUsersRequest;
@@ -129,28 +129,19 @@ impl EventSubClient {
 
     async fn handle_notification(&self, notification: Event) {
         if let Event::ChannelChatMessageV1(payload) = notification {
-            // The payload should contain the event data
-            // Let's try to access the event data directly from the payload
-            // payload should be of type Payload<ChannelChatMessageV1>
-            // and payload.event should contain the ChannelChatMessageV1Payload
-            
-            // Try accessing the event data directly
-            let event_data = &payload.message;
-            
-            // Now access the fields from the actual ChannelChatMessageV1Payload
-            let message_text = &event_data.message.text;
-            let chatter_login = &event_data.chatter_user_login;
-            let chatter_display_name = &event_data.chatter_user_name;
-            
-            // Create a nice formatted message
-            let formatted_message = format!(
-                "{} ({}): {}",
-                chatter_display_name, chatter_login, message_text
-            );
+            if let Message::Notification(event_data) = payload.message {
+                let message_text = &event_data.message.text;
+                let chatter_login = &event_data.chatter_user_login;
+                let chatter_display_name = &event_data.chatter_user_name;
+                
+                let formatted_message = format!(
+                    "{} ({}): {}",
+                    chatter_display_name, chatter_login, message_text
+                );
 
-            // Send the formatted message to the UI
-            if let Err(e) = self.message_tx.send(formatted_message).await {
-                tracing::error!("Failed to send message to UI thread: {}", e);
+                if let Err(e) = self.message_tx.send(formatted_message).await {
+                    tracing::error!("Failed to send message to UI thread: {}", e);
+                }
             }
         }
     }
