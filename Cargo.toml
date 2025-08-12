@@ -1,0 +1,23 @@
+[package]
+name = "livenac"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1.77"
+eframe = "0.32.0"
+egui = "0.32.0"
+eyre = "0.6.11"
+futures = "0.3.30"
+parking_lot = "0.12.1"
+reqwest = { version = "0.12.22", features = ["json"] }
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.114"
+tokio = { version = "1.36.0", features = ["full"] }
+tokio-tungstenite = "0.27.0"
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+twitch_api = { version = "0.7.2", features = ["helix", "reqwest", "eventsub"] }
+twitch_oauth2 = { version = "0.15.2", features = ["reqwest"] }
+twitch_types = "0.4.8"
+url = "2.5.0"

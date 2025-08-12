@@ -1,0 +1,17 @@
+# This is a list of commands for the chatbot.
+# Each command has a 'trigger' (the text to look for after the '!')
+# and a 'response' (what the bot says in return).
+# You can use '{user}' in the response to insert the username of the person who
+# triggered the command.
+
+[[command]]
+trigger = "hello"
+response = "Hello {user}!"
+
+[[command]]
+trigger = "heyguys"
+response = "VoHiYo"
+
+[[command]]
+trigger = "help"
+response = "I can respond to !hello, !heyguys, and !help!"
