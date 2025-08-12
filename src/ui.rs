@@ -1,13 +1,14 @@
-use crate::chat::{ChatClient, AnnouncementColor};
+use crate::chat::{AnnouncementColor, ChatClient};
 use crate::eventsub::{EventSubClient, EventSubMessage};
 use eframe::egui::{self, ScrollArea};
+use reqwest::header;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use twitch_oauth2::{
-    ClientId, DeviceUserTokenBuilder, Scope, UserToken,
-};
+use twitch_oauth2::{ClientId, DeviceUserTokenBuilder, Scope, UserToken};
 use twitch_types::UserId;
+
+const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 // A struct to hold the device flow information.
 #[derive(Clone, Debug)]
@@ -84,9 +85,14 @@ impl eframe::App for LiveNAC {
             match msg {
                 UiMessage::DeviceFlowStarted(info) => {
                     if let AppState::LoggedOut {
-                        device_flow_info, ..
+                        auth_in_progress,
+                        device_flow_info,
+                        ..
                     } = &mut self.state
                     {
+                        // We are now waiting for user input, so auth is no longer "in progress"
+                        // from the app's perspective. The spinner can be removed.
+                        *auth_in_progress = false;
                         *device_flow_info = Some(info);
                     }
                 }
@@ -193,6 +199,7 @@ impl LiveNAC {
                     ui.label("And enter this code:");
                     ui.heading(&info.user_code);
                     ui.spinner();
+                    ui.label("Waiting for you to authorize in the browser...");
                 } else {
                     ui.label("Client ID:");
                     ui.text_edit_singleline(client_id_input);
@@ -205,21 +212,34 @@ impl LiveNAC {
                         ui.add_enabled_ui(!is_client_id_empty, |ui| {
                             if ui.button("Login to Twitch").clicked() {
                                 *auth_in_progress = true;
+                                *error = None; // Clear previous errors
                                 let tx = self.ui_message_tx.clone();
                                 let client_id = client_id_input.clone();
 
                                 self.tokio_runtime_handle.spawn(async move {
                                     tracing::info!("Starting Twitch device flow...");
-                                    let client = reqwest::Client::new();
+                                    let mut headers = header::HeaderMap::new();
+                                    headers.insert(
+                                        header::USER_AGENT,
+                                        header::HeaderValue::from_static(APP_USER_AGENT),
+                                    );
+                                    let client = match reqwest::Client::builder()
+                                        .default_headers(headers)
+                                        .build()
+                                    {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            tracing::error!("Failed to build http client: {}", e);
+                                            let _ = tx.send(UiMessage::Error(format!("Internal error: Failed to build http client: {}", e))).await;
+                                            return;
+                                        }
+                                    };
+
                                     let scopes = vec![
-                                        Scope::UserReadChat,
-                                        Scope::UserWriteChat,
                                         Scope::ChatRead,
                                         Scope::ChatEdit,
+                                        Scope::UserReadChat,
                                         Scope::ModeratorManageAnnouncements,
-                                        Scope::ModeratorReadBannedUsers,
-                                        Scope::UserReadEmotes,
-                                        Scope::ModeratorReadChatters,
                                     ];
                                     let mut builder =
                                         DeviceUserTokenBuilder::new(ClientId::new(client_id), scopes);
@@ -259,6 +279,13 @@ impl LiveNAC {
                                             return;
                                         }
                                     };
+                                    
+                                    // Validate the token as a final check
+                                    let chat_client = ChatClient::new();
+                                    if let Err(e) = chat_client.validate_token(&token).await {
+                                        tracing::error!("Token validation failed after acquiring: {}", e);
+                                        // Not treating this as a fatal error, but logging it.
+                                    }
 
                                     let user_login = token.login.to_string();
                                     tracing::info!("Login successful for user '{}'. Sending to UI.", &user_login);
@@ -330,7 +357,6 @@ impl LiveNAC {
                     token,
                     user_id,
                     message_tx,
-                    chat_client,
                     ..
                 } = &mut self.state
                 {
@@ -343,11 +369,11 @@ impl LiveNAC {
                         let channel_login_clone = channel_to_join.clone();
                         let user_id_clone = user_id.clone();
                         let ui_tx = self.ui_message_tx.clone();
-                        let chat_client_clone = chat_client.clone();
+                        let chat_client = ChatClient::new();
 
                         self.tokio_runtime_handle.spawn(async move {
                             // Get broadcaster ID
-                            match chat_client_clone
+                            match chat_client
                                 .get_user_id(&channel_login_clone, &token_clone)
                                 .await
                             {
@@ -356,7 +382,7 @@ impl LiveNAC {
 
                                     let client =
                                         EventSubClient::new(user_id_clone, token_clone, event_sub_tx);
-                                    if let Err(e) = client.run(channel_login_clone).await {
+                                    if let Err(e) = client.run(broadcaster_id).await {
                                         tracing::error!("EventSub client failed: {}", e);
                                         let _ = ui_tx
                                             .send(UiMessage::Error(format!(
@@ -493,7 +519,7 @@ impl LiveNAC {
                 let ui_tx = self.ui_message_tx.clone();
 
                 self.tokio_runtime_handle.spawn(async move {
-                    // First get the broadcaster ID if we don't have it
+                    // First get the broadcaster ID
                     let broadcaster_id =
                         match chat_client_clone.get_user_id(&channel, &token_clone).await {
                             Ok(Some(id)) => id,

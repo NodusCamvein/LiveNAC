@@ -1,15 +1,20 @@
-use reqwest::Client as ReqwestClient;
+use eyre::Report;
+use reqwest::{header, Client as ReqwestClient};
+use twitch_api::helix::chat::send_chat_announcement::{
+    SendChatAnnouncementBody, SendChatAnnouncementRequest,
+};
 use twitch_api::helix::chat::send_chat_message::{SendChatMessageBody, SendChatMessageRequest};
-use twitch_api::helix::chat::send_chat_announcement::{SendChatAnnouncementBody, SendChatAnnouncementRequest};
 use twitch_api::helix::users::GetUsersRequest;
-use twitch_api::HelixClient;
+use twitch_api::helix::HelixClient;
 use twitch_oauth2::UserToken;
 use twitch_types::{UserId, UserIdRef};
-use eyre::Report;
+
+const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Default)]
 pub struct ChatClient {
     helix_client: HelixClient<'static, ReqwestClient>,
+    reqwest_client: ReqwestClient,
 }
 
 #[derive(Debug, Clone)]
@@ -36,8 +41,49 @@ impl AnnouncementColor {
 
 impl ChatClient {
     pub fn new() -> Self {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            header::HeaderValue::from_static(APP_USER_AGENT),
+        );
+        let client = ReqwestClient::builder()
+            .default_headers(headers)
+            .build()
+            .expect("Failed to build reqwest client");
+
         Self {
-            helix_client: HelixClient::with_client(ReqwestClient::new()),
+            helix_client: HelixClient::with_client(client.clone()),
+            reqwest_client: client,
+        }
+    }
+
+    /// Validates the token against the Twitch API.
+    pub async fn validate_token(&self, token: &UserToken) -> Result<(), Report> {
+        tracing::info!("Validating token...");
+        let validation_url = "https://id.twitch.tv/oauth2/validate";
+        let response = self
+            .reqwest_client
+            .get(validation_url)
+            .header(
+                "Authorization",
+                format!("OAuth {}", token.access_token.secret()),
+            )
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let body = response.text().await?;
+            tracing::info!("Token validation successful: {}", body);
+            Ok(())
+        } else {
+            let status = response.status();
+            let body = response.text().await?;
+            tracing::error!("Token validation failed with status {}: {}", status, body);
+            Err(eyre::eyre!(
+                "Token validation failed with status {}: {}",
+                status,
+                body
+            ))
         }
     }
 
@@ -85,7 +131,6 @@ impl ChatClient {
     ) -> Result<(), Report> {
         let request = SendChatAnnouncementRequest::new(broadcaster_id, moderator_id);
 
-        // Fix: Handle the Result returned by SendChatAnnouncementBody::new
         let body = if let Some(color) = color {
             SendChatAnnouncementBody::new(message, color.as_str())?
         } else {

@@ -1,19 +1,21 @@
-use eyre::Report;
 use futures::StreamExt;
-use reqwest::Client as ReqwestClient;
+use reqwest::{header, Client as ReqwestClient};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use twitch_api::eventsub::{
     channel::ChannelChatMessageV1,
     event::websocket::{EventsubWebsocketData, WelcomePayload},
-    Transport, Event, Message,
+    Event, Message, Transport,
 };
-use twitch_api::helix::eventsub::{CreateEventSubSubscriptionBody, CreateEventSubSubscriptionRequest};
-use twitch_api::helix::users::GetUsersRequest;
+use twitch_api::helix::eventsub::{
+    CreateEventSubSubscriptionBody, CreateEventSubSubscriptionRequest,
+};
 use twitch_api::HelixClient;
 use twitch_oauth2::UserToken;
 use twitch_types::UserId;
+
+const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 pub type EventSubMessage = String;
 
@@ -30,32 +32,29 @@ impl EventSubClient {
         token: Arc<UserToken>,
         message_tx: mpsc::Sender<EventSubMessage>,
     ) -> Self {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::USER_AGENT,
+            header::HeaderValue::from_static(APP_USER_AGENT),
+        );
+        let client = ReqwestClient::builder()
+            .default_headers(headers)
+            .build()
+            .expect("Failed to build reqwest client");
+
         Self {
-            helix_client: HelixClient::with_client(ReqwestClient::new()),
+            helix_client: HelixClient::with_client(client),
             user_id,
             token,
             message_tx,
         }
     }
 
-    /// Fetches a user's ID from their login name.
-    /// This is needed to create the subscription.
-    pub async fn get_user_id(&self, login: &str) -> Result<Option<UserId>, Report> {
-        let logins: &[&str] = &[login];
-        let request = GetUsersRequest::logins(logins);
-        let response = self
-            .helix_client
-            .req_get(request, &*self.token)
-            .await?
-            .data;
-        Ok(response.into_iter().next().map(|u| u.id))
-    }
-
-    pub async fn run(self, broadcaster_login: String) -> Result<(), eyre::Report> {
-        tracing::info!("Starting EventSub client for: {}", &broadcaster_login);
-
-        // Get the broadcaster's user ID from their login name.
-        let broadcaster_id = self.get_user_id(&broadcaster_login).await?.unwrap();
+    pub async fn run(self, broadcaster_id: UserId) -> Result<(), eyre::Report> {
+        tracing::info!(
+            "Starting EventSub client for broadcaster ID: {}",
+            &broadcaster_id
+        );
 
         // Connect to the EventSub websocket.
         let (ws_stream, _) = connect_async("wss://eventsub.wss.twitch.tv/ws").await?;
