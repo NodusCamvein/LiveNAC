@@ -135,7 +135,7 @@ impl EventSubClient {
             // and payload.event should contain the ChannelChatMessageV1Payload
             
             // Try accessing the event data directly
-            let event_data = &payload.event;
+            let event_data = &payload.message;
             
             // Now access the fields from the actual ChannelChatMessageV1Payload
             let message_text = &event_data.message.text;
