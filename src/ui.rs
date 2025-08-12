@@ -174,93 +174,114 @@ impl eframe::App for LiveNAC {
 }
 
 impl LiveNAC {
-fn draw_logged_out(&mut self, ctx: &egui::Context) {
-    if let AppState::LoggedOut {
-        client_id_input,
-        auth_in_progress,
-        error,
-        device_flow_info,
-    } = &mut self.state
-    {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("LiveNAC: Twitch Chat Client");
-            ui.add_space(20.0);
+    fn draw_logged_out(&mut self, ctx: &egui::Context) {
+        if let AppState::LoggedOut {
+            client_id_input,
+            auth_in_progress,
+            error,
+            device_flow_info,
+        } = &mut self.state
+        {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading("LiveNAC: Twitch Chat Client");
+                ui.add_space(20.0);
 
-            if let Some(info) = device_flow_info {
-                ui.heading("Login to Twitch");
-                ui.label("Please go to the following URL in your browser:");
-                ui.hyperlink(&info.uri);
-                ui.label("And enter this code:");
-                ui.heading(&info.user_code);
-                ui.spinner();
-            } else {
-                ui.label("Client ID:");
-                ui.text_edit_singleline(client_id_input);
-
-                if *auth_in_progress {
+                if let Some(info) = device_flow_info {
+                    ui.heading("Login to Twitch");
+                    ui.label("Please go to the following URL in your browser:");
+                    ui.hyperlink(&info.uri);
+                    ui.label("And enter this code:");
+                    ui.heading(&info.user_code);
                     ui.spinner();
-                    ui.label("Starting login process...");
-                } else if ui.button("Login to Twitch").clicked() {
-                    *auth_in_progress = true;
-                    let tx = self.ui_message_tx.clone();
-                    let client_id = client_id_input.clone();
+                } else {
+                    ui.label("Client ID:");
+                    ui.text_edit_singleline(client_id_input);
 
-                    self.tokio_runtime_handle.spawn(async move {
-                        let client = reqwest::Client::new();
-                        let scopes = vec![
-                            Scope::UserReadChat,
-                            Scope::UserWriteChat,
-                            Scope::ChatRead,
-                            Scope::ChatEdit,
-                            Scope::ModeratorManageAnnouncements,
-                            Scope::ModeratorReadBannedUsers,
-                            Scope::UserReadEmotes,
-                            Scope::ModeratorReadChatters,
-                        ];
-                        let mut builder =
-                            DeviceUserTokenBuilder::new(ClientId::new(client_id), scopes);
+                    if *auth_in_progress {
+                        ui.spinner();
+                        ui.label("Starting login process...");
+                    } else {
+                        let is_client_id_empty = client_id_input.is_empty();
+                        ui.add_enabled_ui(!is_client_id_empty, |ui| {
+                            if ui.button("Login to Twitch").clicked() {
+                                *auth_in_progress = true;
+                                let tx = self.ui_message_tx.clone();
+                                let client_id = client_id_input.clone();
 
-                        let code = match builder.start(&client).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                let _ = tx.send(UiMessage::Error(format!("Failed to start device flow: {}", e))).await;
-                                return;
+                                self.tokio_runtime_handle.spawn(async move {
+                                    tracing::info!("Starting Twitch device flow...");
+                                    let client = reqwest::Client::new();
+                                    let scopes = vec![
+                                        Scope::UserReadChat,
+                                        Scope::UserWriteChat,
+                                        Scope::ChatRead,
+                                        Scope::ChatEdit,
+                                        Scope::ModeratorManageAnnouncements,
+                                        Scope::ModeratorReadBannedUsers,
+                                        Scope::UserReadEmotes,
+                                        Scope::ModeratorReadChatters,
+                                    ];
+                                    let mut builder =
+                                        DeviceUserTokenBuilder::new(ClientId::new(client_id), scopes);
+
+                                    tracing::info!("Requesting device code from Twitch...");
+                                    let code = match builder.start(&client).await {
+                                        Ok(c) => {
+                                            tracing::info!("Device code received successfully.");
+                                            c
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to start device flow: {}", e);
+                                            let _ = tx.send(UiMessage::Error(format!("Failed to start device flow: {}", e))).await;
+                                            return;
+                                        }
+                                    };
+
+                                    let info = DeviceFlowInfo {
+                                        uri: code.verification_uri.to_string(),
+                                        user_code: code.user_code.clone(),
+                                    };
+                                    tracing::info!("Sending device flow info to UI thread.");
+                                    if tx.send(UiMessage::DeviceFlowStarted(info)).await.is_err() {
+                                        tracing::error!("UI message channel closed.");
+                                        return;
+                                    }
+
+                                    tracing::info!("Waiting for user to authorize in browser...");
+                                    let token = match builder.wait_for_code(&client, tokio::time::sleep).await {
+                                        Ok(t) => {
+                                            tracing::info!("User authorized successfully, token received.");
+                                            t
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to get token: {}", e);
+                                            let _ = tx.send(UiMessage::Error(format!("Failed to get token: {}", e))).await;
+                                            return;
+                                        }
+                                    };
+
+                                    let user_login = token.login.to_string();
+                                    tracing::info!("Login successful for user '{}'. Sending to UI.", &user_login);
+
+                                    let msg = UiMessage::LoggedIn {
+                                        user_id: token.user_id.clone(),
+                                        user_login,
+                                        token: Arc::new(token),
+                                    };
+                                    let _ = tx.send(msg).await;
+                                });
                             }
-                        };
-
-                        let info = DeviceFlowInfo {
-                            uri: code.verification_uri.to_string(),
-                            user_code: code.user_code.clone(),
-                        };
-                        if tx.send(UiMessage::DeviceFlowStarted(info)).await.is_err() {
-                            return;
-                        }
-
-                        let token = match builder.wait_for_code(&client, tokio::time::sleep).await {
-                            Ok(t) => t,
-                            Err(e) => {
-                                let _ = tx.send(UiMessage::Error(format!("Failed to get token: {}", e))).await;
-                                return;
-                            }
-                        };
-
-                        let msg = UiMessage::LoggedIn {
-                            user_id: token.user_id.clone(),
-                            user_login: token.login.to_string(),
-                            token: Arc::new(token),
-                        };
-                        let _ = tx.send(msg).await;
-                    });
+                        });
+                    }
                 }
-            }
 
-            if let Some(error_message) = error {
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new(error_message.clone()).color(egui::Color32::RED));
-            }
-        });
+                if let Some(error_message) = error {
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new(error_message.clone()).color(egui::Color32::RED));
+                }
+            });
+        }
     }
-}
 
     fn draw_logged_in(&mut self, ctx: &egui::Context) {
         // First, process incoming messages outside the UI closure

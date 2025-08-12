@@ -4,9 +4,12 @@ mod ui;
 
 use eframe::NativeOptions;
 use tokio::runtime::Runtime;
+use tracing_subscriber::EnvFilter;
 
 fn main() -> eframe::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
     let runtime = Runtime::new().expect("Failed to create Tokio runtime");
 
     let native_options = NativeOptions::default();
