@@ -133,7 +133,7 @@ impl EventSubClient {
                 let message_text = &event_data.message.text;
                 let chatter_login = &event_data.chatter_user_login;
                 let chatter_display_name = &event_data.chatter_user_name;
-                
+
                 let formatted_message = format!(
                     "{} ({}): {}",
                     chatter_display_name, chatter_login, message_text

@@ -13,6 +13,7 @@ pub struct ChatClient {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum AnnouncementColor {
     Blue,
     Green,
@@ -25,7 +26,7 @@ impl AnnouncementColor {
     pub fn as_str(&self) -> &'static str {
         match self {
             AnnouncementColor::Blue => "blue",
-            AnnouncementColor::Green => "green", 
+            AnnouncementColor::Green => "green",
             AnnouncementColor::Orange => "orange",
             AnnouncementColor::Purple => "purple",
             AnnouncementColor::Primary => "primary",
@@ -83,7 +84,7 @@ impl ChatClient {
         token: &UserToken,
     ) -> Result<(), Report> {
         let request = SendChatAnnouncementRequest::new(broadcaster_id, moderator_id);
-        
+
         // Fix: Handle the Result returned by SendChatAnnouncementBody::new
         let body = if let Some(color) = color {
             SendChatAnnouncementBody::new(message, color.as_str())?

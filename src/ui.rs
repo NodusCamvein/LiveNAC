@@ -160,7 +160,7 @@ impl LiveNAC {
                     self.tokio_runtime_handle.spawn(async move {
                         // Simulate login delay
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        
+
                         let token = UserToken::from_existing(
                             &reqwest::Client::new(),
                             AccessToken::new("mock_access_token".to_string()),
@@ -238,13 +238,13 @@ impl LiveNAC {
                         let user_id_clone = user_id.clone();
                         let ui_tx = self.ui_message_tx.clone();
                         let chat_client_clone = chat_client.clone();
-                        
+
                         self.tokio_runtime_handle.spawn(async move {
                             // Get broadcaster ID
                             match chat_client_clone.get_user_id(&channel_login_clone, &token_clone).await {
                                 Ok(Some(broadcaster_id)) => {
                                     tracing::info!("Broadcaster ID: {}", broadcaster_id);
-                                    
+
                                     let client = EventSubClient::new(user_id_clone, token_clone, event_sub_tx);
                                     if let Err(e) = client.run(channel_login_clone).await {
                                         tracing::error!("EventSub client failed: {}", e);
@@ -295,15 +295,15 @@ impl LiveNAC {
                 } = &mut self.state {
                     ui.label("Message:");
                     ui.text_edit_multiline(message_to_send);
-                    
-                    let can_send = !message_to_send.is_empty() && 
-                                   current_channel.is_some() && 
+
+                    let can_send = !message_to_send.is_empty() &&
+                                   current_channel.is_some() &&
                                    !*send_in_progress;
-                    
+
                     // Clone the message for the button handlers
                     let message_for_send = message_to_send.clone();
                     let message_for_announcement = message_to_send.clone();
-                    
+
                     ui.add_enabled_ui(can_send, |ui| {
                         if ui.button("Send").clicked() {
                             if let Err(e) = ChatClient::validate_message(&message_for_send) {
@@ -312,7 +312,7 @@ impl LiveNAC {
                                 send_action = Some((message_for_send, false));
                             }
                         }
-                        
+
                         if ui.button("Send Announcement").clicked() {
                             if let Err(e) = ChatClient::validate_message(&message_for_announcement) {
                                 *last_error = Some(format!("Message validation failed: {}", e));
@@ -321,7 +321,7 @@ impl LiveNAC {
                             }
                         }
                     });
-                    
+
                     if *send_in_progress {
                         ui.spinner();
                     }
