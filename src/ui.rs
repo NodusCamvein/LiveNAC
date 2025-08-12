@@ -1,14 +1,24 @@
-use crate::eventsub::{EventSubClient, EventSubMessage};
 use crate::chat::{ChatClient, AnnouncementColor};
+use crate::eventsub::{EventSubClient, EventSubMessage};
 use eframe::egui::{self, ScrollArea};
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use twitch_oauth2::{AccessToken, UserToken};
+use twitch_oauth2::{
+    ClientId, DeviceUserTokenBuilder, Scope, UserToken,
+};
 use twitch_types::UserId;
+
+// A struct to hold the device flow information.
+#[derive(Clone, Debug)]
+struct DeviceFlowInfo {
+    uri: String,
+    user_code: String,
+}
 
 // An enum to handle communication from async tasks to the UI thread.
 enum UiMessage {
+    DeviceFlowStarted(DeviceFlowInfo),
     LoggedIn {
         token: Arc<UserToken>,
         user_id: UserId,
@@ -24,6 +34,7 @@ enum AppState {
         client_id_input: String,
         auth_in_progress: bool,
         error: Option<String>,
+        device_flow_info: Option<DeviceFlowInfo>,
     },
     LoggedIn {
         token: Arc<UserToken>,
@@ -57,6 +68,7 @@ impl LiveNAC {
                 client_id_input: "".to_owned(),
                 auth_in_progress: false,
                 error: None,
+                device_flow_info: None,
             },
             tokio_runtime_handle,
             ui_message_rx,
@@ -70,6 +82,14 @@ impl eframe::App for LiveNAC {
         // Handle UI messages
         while let Ok(msg) = self.ui_message_rx.try_recv() {
             match msg {
+                UiMessage::DeviceFlowStarted(info) => {
+                    if let AppState::LoggedOut {
+                        device_flow_info, ..
+                    } = &mut self.state
+                    {
+                        *device_flow_info = Some(info);
+                    }
+                }
                 UiMessage::LoggedIn {
                     token,
                     user_id,
@@ -95,21 +115,33 @@ impl eframe::App for LiveNAC {
                     if let AppState::LoggedOut {
                         auth_in_progress,
                         error,
+                        device_flow_info,
                         ..
                     } = &mut self.state
                     {
                         *auth_in_progress = false;
                         *error = Some(err);
+                        *device_flow_info = None;
                     }
                 }
                 UiMessage::MessageSent => {
-                    if let AppState::LoggedIn { send_in_progress, message_to_send, .. } = &mut self.state {
+                    if let AppState::LoggedIn {
+                        send_in_progress,
+                        message_to_send,
+                        ..
+                    } = &mut self.state
+                    {
                         *send_in_progress = false;
                         message_to_send.clear();
                     }
                 }
                 UiMessage::MessageSendError(err) => {
-                    if let AppState::LoggedIn { send_in_progress, last_error, .. } = &mut self.state {
+                    if let AppState::LoggedIn {
+                        send_in_progress,
+                        last_error,
+                        ..
+                    } = &mut self.state
+                    {
                         *send_in_progress = false;
                         *last_error = Some(err);
                     }
@@ -121,7 +153,11 @@ impl eframe::App for LiveNAC {
             AppState::LoggedOut { .. } => {
                 self.draw_logged_out(ctx);
             }
-            AppState::LoggedIn { message_rx, chat_messages, .. } => {
+            AppState::LoggedIn {
+                message_rx,
+                chat_messages,
+                ..
+            } => {
                 // Process incoming chat messages
                 while let Ok(message) = message_rx.try_recv() {
                     chat_messages.push(message);
@@ -138,58 +174,102 @@ impl eframe::App for LiveNAC {
 }
 
 impl LiveNAC {
-    fn draw_logged_out(&mut self, ctx: &egui::Context) {
-        if let AppState::LoggedOut {
-            client_id_input,
-            auth_in_progress,
-            error,
-        } = &mut self.state
-        {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading("LiveNAC: Twitch Chat Client");
-                ui.add_space(20.0);
+fn draw_logged_out(&mut self, ctx: &egui::Context) {
+    if let AppState::LoggedOut {
+        client_id_input,
+        auth_in_progress,
+        error,
+        device_flow_info,
+    } = &mut self.state
+    {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("LiveNAC: Twitch Chat Client");
+            ui.add_space(20.0);
+
+            if let Some(info) = device_flow_info {
+                ui.heading("Login to Twitch");
+                ui.label("Please go to the following URL in your browser:");
+                ui.hyperlink(&info.uri);
+                ui.label("And enter this code:");
+                ui.heading(&info.user_code);
+                ui.spinner();
+            } else {
                 ui.label("Client ID:");
                 ui.text_edit_singleline(client_id_input);
 
                 if *auth_in_progress {
                     ui.spinner();
-                    ui.label("Waiting for login...");
-                } else if ui.button("Login to Twitch (Simulated)").clicked() {
+                    ui.label("Starting login process...");
+                } else if ui.button("Login to Twitch").clicked() {
                     *auth_in_progress = true;
                     let tx = self.ui_message_tx.clone();
-                    self.tokio_runtime_handle.spawn(async move {
-                        // Simulate login delay
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    let client_id = client_id_input.clone();
 
-                        let token = UserToken::from_existing(
-                            &reqwest::Client::new(),
-                            AccessToken::new("mock_access_token".to_string()),
-                            None,
-                            None,
-                        )
-                        .await
-                        .unwrap();
+                    self.tokio_runtime_handle.spawn(async move {
+                        let client = reqwest::Client::new();
+                        let scopes = vec![
+                            Scope::UserReadChat,
+                            Scope::UserWriteChat,
+                            Scope::ChatRead,
+                            Scope::ChatEdit,
+                            Scope::ModeratorManageAnnouncements,
+                            Scope::ModeratorReadBannedUsers,
+                            Scope::UserReadEmotes,
+                            Scope::ModeratorReadChatters,
+                        ];
+                        let mut builder =
+                            DeviceUserTokenBuilder::new(ClientId::new(client_id), scopes);
+
+                        let code = match builder.start(&client).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = tx.send(UiMessage::Error(format!("Failed to start device flow: {}", e))).await;
+                                return;
+                            }
+                        };
+
+                        let info = DeviceFlowInfo {
+                            uri: code.verification_uri.to_string(),
+                            user_code: code.user_code.clone(),
+                        };
+                        if tx.send(UiMessage::DeviceFlowStarted(info)).await.is_err() {
+                            return;
+                        }
+
+                        let token = match builder.wait_for_code(&client, tokio::time::sleep).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                let _ = tx.send(UiMessage::Error(format!("Failed to get token: {}", e))).await;
+                                return;
+                            }
+                        };
 
                         let msg = UiMessage::LoggedIn {
+                            user_id: token.user_id.clone(),
+                            user_login: token.login.to_string(),
                             token: Arc::new(token),
-                            user_id: "12345".to_string().into(),
-                            user_login: "twitchdev".to_string(),
                         };
                         let _ = tx.send(msg).await;
                     });
                 }
+            }
 
-                if let Some(error_message) = error {
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new(error_message.clone()).color(egui::Color32::RED));
-                }
-            });
-        }
+            if let Some(error_message) = error {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(error_message.clone()).color(egui::Color32::RED));
+            }
+        });
     }
+}
 
     fn draw_logged_in(&mut self, ctx: &egui::Context) {
         // First, process incoming messages outside the UI closure
-        if let AppState::LoggedIn { message_rx, chat_messages, .. } = &mut self.state {
+        if let AppState::LoggedIn {
+            message_rx,
+            chat_messages,
+            ..
+        } = &mut self.state
+        {
             while let Ok(message) = message_rx.try_recv() {
                 chat_messages.push(message);
                 // Keep only the last 100 messages to prevent memory issues
@@ -206,7 +286,11 @@ impl LiveNAC {
                 current_channel,
                 chat_messages,
                 ..
-            } => (user_login.clone(), current_channel.clone(), chat_messages.len()),
+            } => (
+                user_login.clone(),
+                current_channel.clone(),
+                chat_messages.len(),
+            ),
             _ => return,
         };
 
@@ -227,7 +311,8 @@ impl LiveNAC {
                     message_tx,
                     chat_client,
                     ..
-                } = &mut self.state {
+                } = &mut self.state
+                {
                     ui.label("Join Channel:");
                     ui.text_edit_singleline(channel_to_join);
                     if ui.button("Join").clicked() && !channel_to_join.is_empty() {
@@ -241,21 +326,37 @@ impl LiveNAC {
 
                         self.tokio_runtime_handle.spawn(async move {
                             // Get broadcaster ID
-                            match chat_client_clone.get_user_id(&channel_login_clone, &token_clone).await {
+                            match chat_client_clone
+                                .get_user_id(&channel_login_clone, &token_clone)
+                                .await
+                            {
                                 Ok(Some(broadcaster_id)) => {
                                     tracing::info!("Broadcaster ID: {}", broadcaster_id);
 
-                                    let client = EventSubClient::new(user_id_clone, token_clone, event_sub_tx);
+                                    let client =
+                                        EventSubClient::new(user_id_clone, token_clone, event_sub_tx);
                                     if let Err(e) = client.run(channel_login_clone).await {
                                         tracing::error!("EventSub client failed: {}", e);
-                                        let _ = ui_tx.send(UiMessage::Error(format!("Failed to connect to chat: {}", e))).await;
+                                        let _ = ui_tx
+                                            .send(UiMessage::Error(format!(
+                                                "Failed to connect to chat: {}",
+                                                e
+                                            )))
+                                            .await;
                                     }
                                 }
                                 Ok(None) => {
-                                    let _ = ui_tx.send(UiMessage::Error("Channel not found".to_string())).await;
+                                    let _ = ui_tx
+                                        .send(UiMessage::Error("Channel not found".to_string()))
+                                        .await;
                                 }
                                 Err(e) => {
-                                    let _ = ui_tx.send(UiMessage::Error(format!("Failed to get channel info: {}", e))).await;
+                                    let _ = ui_tx
+                                        .send(UiMessage::Error(format!(
+                                            "Failed to get channel info: {}",
+                                            e
+                                        )))
+                                        .await;
                                 }
                             }
                         });
@@ -292,13 +393,14 @@ impl LiveNAC {
                     send_in_progress,
                     last_error,
                     ..
-                } = &mut self.state {
+                } = &mut self.state
+                {
                     ui.label("Message:");
                     ui.text_edit_multiline(message_to_send);
 
-                    let can_send = !message_to_send.is_empty() &&
-                                   current_channel.is_some() &&
-                                   !*send_in_progress;
+                    let can_send = !message_to_send.is_empty()
+                        && current_channel.is_some()
+                        && !*send_in_progress;
 
                     // Clone the message for the button handlers
                     let message_for_send = message_to_send.clone();
@@ -314,7 +416,8 @@ impl LiveNAC {
                         }
 
                         if ui.button("Send Announcement").clicked() {
-                            if let Err(e) = ChatClient::validate_message(&message_for_announcement) {
+                            if let Err(e) = ChatClient::validate_message(&message_for_announcement)
+                            {
                                 *last_error = Some(format!("Message validation failed: {}", e));
                             } else {
                                 send_action = Some((message_for_announcement, true));
@@ -329,7 +432,10 @@ impl LiveNAC {
                     // Error display
                     if let Some(error) = last_error {
                         ui.add_space(10.0);
-                        ui.label(egui::RichText::new(format!("Error: {}", error)).color(egui::Color32::RED));
+                        ui.label(
+                            egui::RichText::new(format!("Error: {}", error))
+                                .color(egui::Color32::RED),
+                        );
                         if ui.button("Clear Error").clicked() {
                             *last_error = None;
                         }
@@ -367,17 +473,27 @@ impl LiveNAC {
 
                 self.tokio_runtime_handle.spawn(async move {
                     // First get the broadcaster ID if we don't have it
-                    let broadcaster_id = match chat_client_clone.get_user_id(&channel, &token_clone).await {
-                        Ok(Some(id)) => id,
-                        Ok(None) => {
-                            let _ = ui_tx.send(UiMessage::MessageSendError("Channel not found".to_string())).await;
-                            return;
-                        }
-                        Err(e) => {
-                            let _ = ui_tx.send(UiMessage::MessageSendError(format!("Failed to get channel info: {}", e))).await;
-                            return;
-                        }
-                    };
+                    let broadcaster_id =
+                        match chat_client_clone.get_user_id(&channel, &token_clone).await {
+                            Ok(Some(id)) => id,
+                            Ok(None) => {
+                                let _ = ui_tx
+                                    .send(UiMessage::MessageSendError(
+                                        "Channel not found".to_string(),
+                                    ))
+                                    .await;
+                                return;
+                            }
+                            Err(e) => {
+                                let _ = ui_tx
+                                    .send(UiMessage::MessageSendError(format!(
+                                        "Failed to get channel info: {}",
+                                        e
+                                    )))
+                                    .await;
+                                return;
+                            }
+                        };
 
                     let result = if is_announcement {
                         chat_client_clone
@@ -405,7 +521,12 @@ impl LiveNAC {
                             let _ = ui_tx.send(UiMessage::MessageSent).await;
                         }
                         Err(e) => {
-                            let _ = ui_tx.send(UiMessage::MessageSendError(format!("Failed to send message: {}", e))).await;
+                            let _ = ui_tx
+                                .send(UiMessage::MessageSendError(format!(
+                                    "Failed to send message: {}",
+                                    e
+                                )))
+                                .await;
                         }
                     }
                 });
