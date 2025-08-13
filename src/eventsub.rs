@@ -8,6 +8,7 @@ use twitch_api::eventsub::{
     event::websocket::{EventsubWebsocketData, WelcomePayload},
     Event, Message, Transport,
 };
+use crate::ui::ChatUiMessage;
 use twitch_api::helix::eventsub::{
     CreateEventSubSubscriptionBody, CreateEventSubSubscriptionRequest,
 };
@@ -17,20 +18,18 @@ use twitch_types::UserId;
 
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
-pub type EventSubMessage = String;
-
 pub struct EventSubClient {
     helix_client: HelixClient<'static, ReqwestClient>,
     user_id: UserId,
     token: Arc<UserToken>,
-    message_tx: mpsc::Sender<EventSubMessage>,
+    message_tx: mpsc::Sender<ChatUiMessage>,
 }
 
 impl EventSubClient {
     pub fn new(
         user_id: UserId,
         token: Arc<UserToken>,
-        message_tx: mpsc::Sender<EventSubMessage>,
+        message_tx: mpsc::Sender<ChatUiMessage>,
     ) -> Self {
         let mut headers = header::HeaderMap::new();
         headers.insert(
@@ -138,7 +137,8 @@ impl EventSubClient {
                     chatter_display_name, chatter_login, message_text
                 );
 
-                if let Err(e) = self.message_tx.send(formatted_message).await {
+                let msg = ChatUiMessage::NewChatMessage(formatted_message);
+                if let Err(e) = self.message_tx.send(msg).await {
                     tracing::error!("Failed to send message to UI thread: {}", e);
                 }
             }

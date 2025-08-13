@@ -1,41 +1,36 @@
+use crate::auth::{AuthClient, AuthMessage};
 use crate::chat::{AnnouncementColor, ChatClient};
-use crate::eventsub::{EventSubClient, EventSubMessage};
+use crate::eventsub::EventSubClient;
 use eframe::egui::{self, ScrollArea};
-use reqwest::header;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use twitch_oauth2::{ClientId, DeviceUserTokenBuilder, Scope, UserToken};
+use twitch_oauth2::UserToken;
 use twitch_types::UserId;
 
-const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+/// A message related to chat, eventsub, or sending messages.
+#[derive(Debug)]
+pub enum ChatUiMessage {
+    NewChatMessage(String),
+    MessageSent,
+    MessageSendError(String),
+    EventSubError(String),
+}
 
-// A struct to hold the device flow information.
-#[derive(Clone, Debug)]
+/// Holds the URI and code for the device flow, used to update the UI.
+#[derive(Clone, Debug, Default)]
 struct DeviceFlowInfo {
     uri: String,
     user_code: String,
 }
 
-// An enum to handle communication from async tasks to the UI thread.
-enum UiMessage {
-    DeviceFlowStarted(DeviceFlowInfo),
-    LoggedIn {
-        token: Arc<UserToken>,
-        user_id: UserId,
-        user_login: String,
-    },
-    Error(String),
-    MessageSent,
-    MessageSendError(String),
-}
-
+/// Represents the two main states of the application.
 enum AppState {
     LoggedOut {
         client_id_input: String,
-        auth_in_progress: bool,
-        error: Option<String>,
+        status_message: String,
         device_flow_info: Option<DeviceFlowInfo>,
+        login_started: bool,
     },
     LoggedIn {
         token: Arc<UserToken>,
@@ -45,137 +40,138 @@ enum AppState {
         current_channel: Option<String>,
         message_to_send: String,
         chat_messages: Vec<String>,
-        message_rx: mpsc::Receiver<EventSubMessage>,
-        message_tx: mpsc::Sender<EventSubMessage>,
         chat_client: ChatClient,
         send_in_progress: bool,
         last_error: Option<String>,
     },
 }
 
+/// The main application struct.
 pub struct LiveNAC {
     state: AppState,
     tokio_runtime_handle: Handle,
-    ui_message_rx: mpsc::Receiver<UiMessage>,
-    ui_message_tx: mpsc::Sender<UiMessage>,
+    auth_message_rx: mpsc::Receiver<AuthMessage>,
+    auth_message_tx: mpsc::Sender<AuthMessage>,
+    chat_ui_message_rx: mpsc::Receiver<ChatUiMessage>,
+    chat_ui_message_tx: mpsc::Sender<ChatUiMessage>,
 }
 
 impl LiveNAC {
     pub fn new(cc: &eframe::CreationContext<'_>, tokio_runtime_handle: Handle) -> Self {
         cc.egui_ctx.set_pixels_per_point(1.5);
-        let (ui_message_tx, ui_message_rx) = mpsc::channel(10);
+        let (auth_message_tx, auth_message_rx) = mpsc::channel(10);
+        let (chat_ui_message_tx, chat_ui_message_rx) = mpsc::channel(100);
+
         Self {
             state: AppState::LoggedOut {
-                client_id_input: "".to_owned(),
-                auth_in_progress: false,
-                error: None,
+                client_id_input: String::new(),
+                status_message: "Enter your Twitch App Client ID.".to_string(),
                 device_flow_info: None,
+                login_started: false,
             },
             tokio_runtime_handle,
-            ui_message_rx,
-            ui_message_tx,
+            auth_message_rx,
+            auth_message_tx,
+            chat_ui_message_rx,
+            chat_ui_message_tx,
         }
     }
 }
 
 impl eframe::App for LiveNAC {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Handle UI messages
-        while let Ok(msg) = self.ui_message_rx.try_recv() {
+        // --- Handle Authentication Messages ---
+        if let Ok(msg) = self.auth_message_rx.try_recv() {
             match msg {
-                UiMessage::DeviceFlowStarted(info) => {
+                AuthMessage::AwaitingDeviceActivation { uri, user_code } => {
                     if let AppState::LoggedOut {
-                        auth_in_progress,
+                        status_message,
                         device_flow_info,
                         ..
                     } = &mut self.state
                     {
-                        // We are now waiting for user input, so auth is no longer "in progress"
-                        // from the app's perspective. The spinner can be removed.
-                        *auth_in_progress = false;
-                        *device_flow_info = Some(info);
+                        *status_message = "Go to the URL and enter the code.".to_string();
+                        *device_flow_info = Some(DeviceFlowInfo { uri, user_code });
                     }
                 }
-                UiMessage::LoggedIn {
-                    token,
-                    user_id,
-                    user_login,
-                } => {
-                    let (message_tx, message_rx) = mpsc::channel(100);
+                AuthMessage::Success(token) => {
+                    let user_id = token.user_id.clone();
+                    let user_login = token.login.to_string();
                     self.state = AppState::LoggedIn {
-                        token,
+                        token: Arc::new(token),
                         user_id,
                         user_login,
-                        channel_to_join: "".to_owned(),
+                        channel_to_join: String::new(),
                         current_channel: None,
-                        message_to_send: "".to_owned(),
+                        message_to_send: String::new(),
                         chat_messages: Vec::new(),
-                        message_rx,
-                        message_tx,
                         chat_client: ChatClient::new(),
                         send_in_progress: false,
                         last_error: None,
                     };
                 }
-                UiMessage::Error(err) => {
+                AuthMessage::Error(err) => {
                     if let AppState::LoggedOut {
-                        auth_in_progress,
-                        error,
+                        status_message,
+                        login_started,
                         device_flow_info,
                         ..
                     } = &mut self.state
                     {
-                        *auth_in_progress = false;
-                        *error = Some(err);
+                        *status_message = format!("Error: {}", err);
+                        *login_started = false;
                         *device_flow_info = None;
-                    }
-                }
-                UiMessage::MessageSent => {
-                    if let AppState::LoggedIn {
-                        send_in_progress,
-                        message_to_send,
-                        ..
-                    } = &mut self.state
-                    {
-                        *send_in_progress = false;
-                        message_to_send.clear();
-                    }
-                }
-                UiMessage::MessageSendError(err) => {
-                    if let AppState::LoggedIn {
-                        send_in_progress,
-                        last_error,
-                        ..
-                    } = &mut self.state
-                    {
-                        *send_in_progress = false;
-                        *last_error = Some(err);
                     }
                 }
             }
         }
 
-        match &mut self.state {
-            AppState::LoggedOut { .. } => {
-                self.draw_logged_out(ctx);
-            }
-            AppState::LoggedIn {
-                message_rx,
-                chat_messages,
-                ..
-            } => {
-                // Process incoming chat messages
-                while let Ok(message) = message_rx.try_recv() {
-                    chat_messages.push(message);
-                    // Keep only the last 100 messages to prevent memory issues
-                    if chat_messages.len() > 100 {
-                        chat_messages.remove(0);
+        // --- Handle Chat UI Messages ---
+        if let AppState::LoggedIn {
+            chat_messages,
+            send_in_progress,
+            last_error,
+            message_to_send,
+            ..
+        } = &mut self.state
+        {
+            while let Ok(msg) = self.chat_ui_message_rx.try_recv() {
+                match msg {
+                    ChatUiMessage::NewChatMessage(message) => {
+                        chat_messages.push(message);
+                        if chat_messages.len() > 100 {
+                            chat_messages.remove(0);
+                        }
+                    }
+                    ChatUiMessage::MessageSent => {
+                        *send_in_progress = false;
+                        message_to_send.clear();
+                    }
+                    ChatUiMessage::MessageSendError(err) => {
+                        *send_in_progress = false;
+                        *last_error = Some(err);
+                    }
+                    ChatUiMessage::EventSubError(err) => {
+                        *last_error = Some(format!("Chat connection error: {}", err));
                     }
                 }
-                self.draw_logged_in(ctx);
             }
         }
-        ctx.request_repaint();
+
+        // --- Draw the UI ---
+        // This is deferred until after the UI is drawn to avoid borrow checker errors.
+        let mut send_action: Option<bool> = None;
+
+        match &mut self.state {
+            AppState::LoggedOut { .. } => self.draw_logged_out(ctx),
+            AppState::LoggedIn { .. } => self.draw_logged_in(ctx, &mut send_action),
+        }
+
+        if let Some(is_announcement) = send_action {
+            self.send_message(is_announcement);
+        }
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
 
@@ -183,394 +179,230 @@ impl LiveNAC {
     fn draw_logged_out(&mut self, ctx: &egui::Context) {
         if let AppState::LoggedOut {
             client_id_input,
-            auth_in_progress,
-            error,
+            status_message,
             device_flow_info,
+            login_started,
         } = &mut self.state
         {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.heading("LiveNAC: Twitch Chat Client");
                 ui.add_space(20.0);
+                ui.label(status_message.as_str());
+                ui.add_space(10.0);
 
-                if let Some(info) = device_flow_info {
+                if let Some(info) = &device_flow_info {
                     ui.heading("Login to Twitch");
                     ui.label("Please go to the following URL in your browser:");
                     ui.hyperlink(&info.uri);
+                    ui.add_space(10.0);
                     ui.label("And enter this code:");
                     ui.heading(&info.user_code);
+                    ui.add_space(10.0);
                     ui.spinner();
-                    ui.label("Waiting for you to authorize in the browser...");
                 } else {
-                    ui.label("Client ID:");
+                    ui.label("Twitch Application Client ID:");
                     ui.text_edit_singleline(client_id_input);
 
-                    if *auth_in_progress {
-                        ui.spinner();
-                        ui.label("Starting login process...");
-                    } else {
-                        let is_client_id_empty = client_id_input.is_empty();
-                        ui.add_enabled_ui(!is_client_id_empty, |ui| {
-                            if ui.button("Login to Twitch").clicked() {
-                                *auth_in_progress = true;
-                                *error = None; // Clear previous errors
-                                let tx = self.ui_message_tx.clone();
-                                let client_id = client_id_input.clone();
+                    let is_ready_to_login =
+                        !client_id_input.trim().is_empty() && !*login_started;
 
-                                self.tokio_runtime_handle.spawn(async move {
-                                    tracing::info!("Starting Twitch device flow...");
-                                    let mut headers = header::HeaderMap::new();
-                                    headers.insert(
-                                        header::USER_AGENT,
-                                        header::HeaderValue::from_static(APP_USER_AGENT),
-                                    );
-                                    let client = match reqwest::Client::builder()
-                                        .default_headers(headers)
-                                        .build()
-                                    {
-                                        Ok(c) => c,
-                                        Err(e) => {
-                                            tracing::error!("Failed to build http client: {}", e);
-                                            let _ = tx.send(UiMessage::Error(format!("Internal error: Failed to build http client: {}", e))).await;
-                                            return;
-                                        }
-                                    };
+                    ui.add_enabled_ui(is_ready_to_login, |ui| {
+                        if ui.button("Login to Twitch").clicked() {
+                            *login_started = true;
+                            *status_message = "Attempting to log in...".to_string();
 
-                                    let scopes = vec![
-                                        Scope::ChatRead,
-                                        Scope::ChatEdit,
-                                        Scope::UserReadChat,
-                                        Scope::ModeratorManageAnnouncements,
-                                    ];
-                                    let mut builder =
-                                        DeviceUserTokenBuilder::new(ClientId::new(client_id), scopes);
+                            let client_id = client_id_input.trim().to_string();
+                            let auth_tx = self.auth_message_tx.clone();
+                            let runtime_handle = self.tokio_runtime_handle.clone();
 
-                                    tracing::info!("Requesting device code from Twitch...");
-                                    let code = match builder.start(&client).await {
-                                        Ok(c) => {
-                                            tracing::info!("Device code received successfully.");
-                                            c
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("Failed to start device flow: {}", e);
-                                            let _ = tx.send(UiMessage::Error(format!("Failed to start device flow: {}", e))).await;
-                                            return;
-                                        }
-                                    };
-
-                                    let info = DeviceFlowInfo {
-                                        uri: code.verification_uri.to_string(),
-                                        user_code: code.user_code.clone(),
-                                    };
-                                    tracing::info!("Sending device flow info to UI thread.");
-                                    if tx.send(UiMessage::DeviceFlowStarted(info)).await.is_err() {
-                                        tracing::error!("UI message channel closed.");
-                                        return;
+                            self.tokio_runtime_handle.spawn(async move {
+                                match AuthClient::new(client_id, auth_tx.clone()) {
+                                    Ok(auth_client) => {
+                                        runtime_handle.spawn(async move {
+                                            auth_client.get_or_refresh_token().await;
+                                        });
                                     }
-
-                                    tracing::info!("Waiting for user to authorize in browser...");
-                                    let token = match builder.wait_for_code(&client, tokio::time::sleep).await {
-                                        Ok(t) => {
-                                            tracing::info!("User authorized successfully, token received.");
-                                            t
-                                        }
-                                        Err(e) => {
-                                            tracing::error!("Failed to get token: {}", e);
-                                            let _ = tx.send(UiMessage::Error(format!("Failed to get token: {}", e))).await;
-                                            return;
-                                        }
-                                    };
-                                    
-                                    // Validate the token as a final check
-                                    let chat_client = ChatClient::new();
-                                    if let Err(e) = chat_client.validate_token(&token).await {
-                                        tracing::error!("Token validation failed after acquiring: {}", e);
-                                        // Not treating this as a fatal error, but logging it.
-                                    }
-
-                                    let user_login = token.login.to_string();
-                                    tracing::info!("Login successful for user '{}'. Sending to UI.", &user_login);
-
-                                    let msg = UiMessage::LoggedIn {
-                                        user_id: token.user_id.clone(),
-                                        user_login,
-                                        token: Arc::new(token),
-                                    };
-                                    let _ = tx.send(msg).await;
-                                });
-                            }
-                        });
-                    }
-                }
-
-                if let Some(error_message) = error {
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new(error_message.clone()).color(egui::Color32::RED));
-                }
-            });
-        }
-    }
-
-    fn draw_logged_in(&mut self, ctx: &egui::Context) {
-        // First, process incoming messages outside the UI closure
-        if let AppState::LoggedIn {
-            message_rx,
-            chat_messages,
-            ..
-        } = &mut self.state
-        {
-            while let Ok(message) = message_rx.try_recv() {
-                chat_messages.push(message);
-                // Keep only the last 100 messages to prevent memory issues
-                if chat_messages.len() > 100 {
-                    chat_messages.remove(0);
-                }
-            }
-        }
-
-        // Now extract what we need for the UI
-        let (user_login, current_channel, chat_messages_len) = match &self.state {
-            AppState::LoggedIn {
-                user_login,
-                current_channel,
-                chat_messages,
-                ..
-            } => (
-                user_login.clone(),
-                current_channel.clone(),
-                chat_messages.len(),
-            ),
-            _ => return,
-        };
-
-        let mut send_action: Option<(String, bool)> = None;
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(format!("Logged in as {}", user_login));
-            ui.add_space(20.0);
-
-            // Channel joining section
-            ui.horizontal(|ui| {
-                // Get mutable references for the input fields
-                if let AppState::LoggedIn {
-                    channel_to_join,
-                    current_channel,
-                    token,
-                    user_id,
-                    message_tx,
-                    ..
-                } = &mut self.state
-                {
-                    ui.label("Join Channel:");
-                    ui.text_edit_singleline(channel_to_join);
-                    if ui.button("Join").clicked() && !channel_to_join.is_empty() {
-                        *current_channel = Some(channel_to_join.clone());
-                        let event_sub_tx = message_tx.clone();
-                        let token_clone = token.clone();
-                        let channel_login_clone = channel_to_join.clone();
-                        let user_id_clone = user_id.clone();
-                        let ui_tx = self.ui_message_tx.clone();
-                        let chat_client = ChatClient::new();
-
-                        self.tokio_runtime_handle.spawn(async move {
-                            // Get broadcaster ID
-                            match chat_client
-                                .get_user_id(&channel_login_clone, &token_clone)
-                                .await
-                            {
-                                Ok(Some(broadcaster_id)) => {
-                                    tracing::info!("Broadcaster ID: {}", broadcaster_id);
-
-                                    let client =
-                                        EventSubClient::new(user_id_clone, token_clone, event_sub_tx);
-                                    if let Err(e) = client.run(broadcaster_id).await {
-                                        tracing::error!("EventSub client failed: {}", e);
-                                        let _ = ui_tx
-                                            .send(UiMessage::Error(format!(
-                                                "Failed to connect to chat: {}",
+                                    Err(e) => {
+                                        let _ = auth_tx
+                                            .send(AuthMessage::Error(format!(
+                                                "Initialization failed: {}",
                                                 e
                                             )))
                                             .await;
                                     }
                                 }
-                                Ok(None) => {
-                                    let _ = ui_tx
-                                        .send(UiMessage::Error("Channel not found".to_string()))
-                                        .await;
+                            });
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    fn draw_logged_in(&mut self, ctx: &egui::Context, send_action: &mut Option<bool>) {
+        if let AppState::LoggedIn {
+            user_login,
+            channel_to_join,
+            current_channel,
+            chat_messages,
+            message_to_send,
+            send_in_progress,
+            last_error,
+            token,
+            user_id,
+            chat_client,
+        } = &mut self.state
+        {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.heading(format!("Logged in as {}", user_login));
+                ui.add_space(10.0);
+
+                // Channel joining section
+                ui.horizontal(|ui| {
+                    ui.label("Channel:");
+                    ui.text_edit_singleline(channel_to_join);
+                    if ui.button("Join").clicked() && !channel_to_join.is_empty() {
+                        *current_channel = Some(channel_to_join.clone());
+                        let chat_ui_tx = self.chat_ui_message_tx.clone();
+                        let token = token.clone();
+                        let channel_login = channel_to_join.clone();
+                        let user_id = user_id.clone();
+                        let chat_client = chat_client.clone();
+
+                        self.tokio_runtime_handle.spawn(async move {
+                            match chat_client.get_user_id(&channel_login, &token).await {
+                                Ok(Some(broadcaster_id)) => {
+                                    let eventsub_client =
+                                        EventSubClient::new(user_id, token, chat_ui_tx);
+                                    if let Err(e) = eventsub_client.run(broadcaster_id).await {
+                                        tracing::error!("EventSub client failed: {}", e);
+                                    }
                                 }
-                                Err(e) => {
-                                    let _ = ui_tx
-                                        .send(UiMessage::Error(format!(
-                                            "Failed to get channel info: {}",
-                                            e
-                                        )))
+                                _ => {
+                                    let _ = chat_ui_tx
+                                        .send(ChatUiMessage::EventSubError(
+                                            "Channel not found".to_string(),
+                                        ))
                                         .await;
                                 }
                             }
                         });
                     }
-                }
-            });
+                });
 
-            ui.add_space(10.0);
-            ui.label(format!(
-                "Current Channel: {}",
-                current_channel.as_deref().unwrap_or("None")
-            ));
+                ui.label(format!(
+                    "Current Channel: {}",
+                    current_channel.as_deref().unwrap_or("None")
+                ));
 
-            // Chat messages area
-            ui.add_space(10.0);
-            ui.label("Chat Messages:");
-            ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .max_height(300.0)
-                .show(ui, |ui| {
-                    if let AppState::LoggedIn { chat_messages, .. } = &self.state {
+                // Chat messages area
+                ui.add_space(10.0);
+                ui.separator();
+                ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                         for message in chat_messages.iter() {
                             ui.label(message);
                         }
-                    }
-                });
+                    });
 
-            // Message input section
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if let AppState::LoggedIn {
-                    message_to_send,
-                    current_channel,
-                    send_in_progress,
-                    last_error,
-                    ..
-                } = &mut self.state
-                {
-                    ui.label("Message:");
-                    ui.text_edit_multiline(message_to_send);
+                // Message input section
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(message_to_send);
 
                     let can_send = !message_to_send.is_empty()
                         && current_channel.is_some()
                         && !*send_in_progress;
 
-                    // Clone the message for the button handlers
-                    let message_for_send = message_to_send.clone();
-                    let message_for_announcement = message_to_send.clone();
+                    let send_button = ui.add_enabled(can_send, egui::Button::new("Send"));
+                    if send_button.clicked() {
+                        *send_action = Some(false);
+                    }
 
-                    ui.add_enabled_ui(can_send, |ui| {
-                        if ui.button("Send").clicked() {
-                            if let Err(e) = ChatClient::validate_message(&message_for_send) {
-                                *last_error = Some(format!("Message validation failed: {}", e));
-                            } else {
-                                send_action = Some((message_for_send, false));
-                            }
-                        }
-
-                        if ui.button("Send Announcement").clicked() {
-                            if let Err(e) = ChatClient::validate_message(&message_for_announcement)
-                            {
-                                *last_error = Some(format!("Message validation failed: {}", e));
-                            } else {
-                                send_action = Some((message_for_announcement, true));
-                            }
-                        }
-                    });
+                    let send_announcement_button =
+                        ui.add_enabled(can_send, egui::Button::new("Send Announcement"));
+                    if send_announcement_button.clicked() {
+                        *send_action = Some(true);
+                    }
 
                     if *send_in_progress {
                         ui.spinner();
                     }
+                });
 
-                    // Error display
-                    if let Some(error) = last_error {
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(format!("Error: {}", error))
-                                .color(egui::Color32::RED),
-                        );
-                        if ui.button("Clear Error").clicked() {
-                            *last_error = None;
-                        }
-                    }
+                if let Some(error) = last_error {
+                    ui.label(egui::RichText::new(error.as_str()).color(egui::Color32::RED));
                 }
             });
-
-            // Connection status
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label(format!("Messages in chat: {}", chat_messages_len));
-        });
-
-        if let Some((message, is_announcement)) = send_action {
-            self.send_message(message, is_announcement);
         }
     }
 
-    fn send_message(&mut self, message: String, is_announcement: bool) {
+    fn send_message(&mut self, is_announcement: bool) {
         if let AppState::LoggedIn {
+            current_channel,
+            send_in_progress,
+            last_error,
             token,
             user_id,
-            current_channel,
             chat_client,
-            send_in_progress,
+            message_to_send,
             ..
         } = &mut self.state
         {
             if let Some(channel) = current_channel.clone() {
                 *send_in_progress = true;
-                let token_clone = token.clone();
-                let user_id_clone = user_id.clone();
-                let chat_client_clone = chat_client.clone();
-                let ui_tx = self.ui_message_tx.clone();
+                *last_error = None;
+
+                let token = token.clone();
+                let user_id = user_id.clone();
+                let chat_client = chat_client.clone();
+                let ui_tx = self.chat_ui_message_tx.clone();
+                let message = message_to_send.clone();
 
                 self.tokio_runtime_handle.spawn(async move {
-                    // First get the broadcaster ID
-                    let broadcaster_id =
-                        match chat_client_clone.get_user_id(&channel, &token_clone).await {
-                            Ok(Some(id)) => id,
-                            Ok(None) => {
-                                let _ = ui_tx
-                                    .send(UiMessage::MessageSendError(
-                                        "Channel not found".to_string(),
-                                    ))
-                                    .await;
-                                return;
-                            }
-                            Err(e) => {
-                                let _ = ui_tx
-                                    .send(UiMessage::MessageSendError(format!(
-                                        "Failed to get channel info: {}",
-                                        e
-                                    )))
-                                    .await;
-                                return;
-                            }
-                        };
+                    let broadcaster_id = match chat_client.get_user_id(&channel, &token).await {
+                        Ok(Some(id)) => id,
+                        _ => {
+                            let _ = ui_tx
+                                .send(ChatUiMessage::MessageSendError(
+                                    "Channel not found".to_string(),
+                                ))
+                                .await;
+                            return;
+                        }
+                    };
 
                     let result = if is_announcement {
-                        chat_client_clone
+                        chat_client
                             .send_announcement(
                                 broadcaster_id.as_ref(),
-                                user_id_clone.as_ref(),
+                                user_id.as_ref(),
                                 &message,
                                 Some(AnnouncementColor::Primary),
-                                &token_clone,
+                                &token,
                             )
                             .await
                     } else {
-                        chat_client_clone
+                        chat_client
                             .send_chat_message(
                                 broadcaster_id.as_ref(),
-                                user_id_clone.as_ref(),
+                                user_id.as_ref(),
                                 &message,
-                                &token_clone,
+                                &token,
                             )
                             .await
                     };
 
                     match result {
                         Ok(_) => {
-                            let _ = ui_tx.send(UiMessage::MessageSent).await;
+                            let _ = ui_tx.send(ChatUiMessage::MessageSent).await;
                         }
                         Err(e) => {
                             let _ = ui_tx
-                                .send(UiMessage::MessageSendError(format!(
-                                    "Failed to send message: {}",
+                                .send(ChatUiMessage::MessageSendError(format!(
+                                    "Failed to send: {}",
                                     e
                                 )))
                                 .await;
