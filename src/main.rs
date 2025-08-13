@@ -9,7 +9,6 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
-    // Setup file-based logging
     let file_appender = tracing_appender::rolling::never(".", "livenac.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::fmt()

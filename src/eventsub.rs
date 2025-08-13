@@ -1,5 +1,5 @@
-use crate::ui::UiMessage; // Changed
-use crate::ui::ChatUiMessage; // Still need this for creating the message
+use crate::ui::UiMessage;
+use crate::ui::ChatUiMessage;
 use eyre::eyre;
 use futures::StreamExt;
 use reqwest::Client as ReqwestClient;
@@ -24,7 +24,7 @@ pub struct EventSubClient {
     helix_client: HelixClient<'static, ReqwestClient>,
     user_id: UserId,
     token: Arc<UserToken>,
-    message_tx: mpsc::Sender<UiMessage>, // Changed
+    message_tx: mpsc::Sender<UiMessage>,
     broadcaster_id: UserId,
     session_id: Option<String>,
 }
@@ -33,7 +33,7 @@ impl EventSubClient {
     pub fn new(
         user_id: UserId,
         token: Arc<UserToken>,
-        message_tx: mpsc::Sender<UiMessage>, // Changed
+        message_tx: mpsc::Sender<UiMessage>,
         broadcaster_id: UserId,
     ) -> Self {
         let reqwest_client = ReqwestClient::builder()
@@ -82,7 +82,6 @@ impl EventSubClient {
                         e.to_string(),
                     )))
                     .await;
-                // And then break the loop
                 return Err(e);
             }
         }
