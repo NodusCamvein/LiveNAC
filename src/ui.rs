@@ -1,14 +1,22 @@
 use crate::auth::{AuthClient, AuthMessage};
 use crate::chat::{AnnouncementColor, ChatClient};
+use crate::config;
 use crate::eventsub::EventSubClient;
-use eframe::egui::{self, ScrollArea};
+use eframe::egui::{self, Align, FontDefinitions, FontFamily, Key, Layout, ScrollArea, TopBottomPanel, MenuBar};
 use std::sync::Arc;
-use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle};
 use twitch_oauth2::UserToken;
 use twitch_types::UserId;
 
-/// A message related to chat, eventsub, or sending messages.
+/// A message sent from a background task to the UI thread.
+#[derive(Debug)]
+pub enum UiMessage {
+    ConfigLoaded(Result<config::Config, eyre::Report>),
+    Auth(AuthMessage),
+    Chat(ChatUiMessage),
+}
+
+/// A message specifically for chat-related UI updates.
 #[derive(Debug)]
 pub enum ChatUiMessage {
     NewChatMessage(String),
@@ -17,20 +25,23 @@ pub enum ChatUiMessage {
     EventSubError(String),
 }
 
-/// Holds the URI and code for the device flow, used to update the UI.
+/// Holds the URI and code for the device flow.
 #[derive(Clone, Debug, Default)]
 struct DeviceFlowInfo {
     uri: String,
     user_code: String,
 }
 
-/// Represents the two main states of the application.
+/// Represents the various states of the application's lifecycle.
 enum AppState {
-    LoggedOut {
+    LoadingConfig,
+    FirstTimeSetup {
         client_id_input: String,
+        error: Option<String>,
+    },
+    Authenticating {
         status_message: String,
         device_flow_info: Option<DeviceFlowInfo>,
-        login_started: bool,
     },
     LoggedIn {
         token: Arc<UserToken>,
@@ -43,54 +54,110 @@ enum AppState {
         chat_client: ChatClient,
         send_in_progress: bool,
         last_error: Option<String>,
+        eventsub_task: Option<JoinHandle<()>>,
     },
 }
 
-/// The main application struct.
 pub struct LiveNAC {
     state: AppState,
-    tokio_runtime_handle: Handle,
-    auth_message_rx: mpsc::Receiver<AuthMessage>,
-    auth_message_tx: mpsc::Sender<AuthMessage>,
-    chat_ui_message_rx: mpsc::Receiver<ChatUiMessage>,
-    chat_ui_message_tx: mpsc::Sender<ChatUiMessage>,
+    ui_message_rx: mpsc::Receiver<UiMessage>,
+    ui_message_tx: mpsc::Sender<UiMessage>,
+    config: config::Config,
+    show_settings_window: bool,
+    show_toolbar: bool,
+    last_applied_font_size: f32,
 }
 
 impl LiveNAC {
-    pub fn new(cc: &eframe::CreationContext<'_>, tokio_runtime_handle: Handle) -> Self {
-        cc.egui_ctx.set_pixels_per_point(1.5);
-        let (auth_message_tx, auth_message_rx) = mpsc::channel(10);
-        let (chat_ui_message_tx, chat_ui_message_rx) = mpsc::channel(100);
+    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let (ui_message_tx, ui_message_rx) = mpsc::channel(100);
+        let tx = ui_message_tx.clone();
+        tokio::spawn(async move {
+            let config_result = config::load().await;
+            let _ = tx.send(UiMessage::ConfigLoaded(config_result)).await;
+        });
+
+        let default_config = config::Config::default();
 
         Self {
-            state: AppState::LoggedOut {
-                client_id_input: String::new(),
-                status_message: "Enter your Twitch App Client ID.".to_string(),
-                device_flow_info: None,
-                login_started: false,
-            },
-            tokio_runtime_handle,
-            auth_message_rx,
-            auth_message_tx,
-            chat_ui_message_rx,
-            chat_ui_message_tx,
+            state: AppState::LoadingConfig,
+            ui_message_rx,
+            ui_message_tx,
+            config: default_config.clone(),
+            show_settings_window: false,
+            show_toolbar: false,
+            last_applied_font_size: default_config.font_size,
         }
     }
 }
 
 impl eframe::App for LiveNAC {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- Handle Authentication Messages ---
-        if let Ok(msg) = self.auth_message_rx.try_recv() {
+        self.apply_settings(ctx);
+
+        while let Ok(msg) = self.ui_message_rx.try_recv() {
+            self.handle_message(msg);
+        }
+
+        let mut send_action: Option<bool> = None;
+        let mut login_action: Option<String> = None;
+
+        match &mut self.state {
+            AppState::LoadingConfig => self.draw_loading_ui(ctx),
+            AppState::FirstTimeSetup { .. } => self.draw_first_time_setup(ctx, &mut login_action),
+            AppState::Authenticating { .. } => self.draw_authenticating_ui(ctx),
+            AppState::LoggedIn { .. } => self.draw_logged_in(ctx, &mut send_action),
+        }
+
+        if let Some(is_announcement) = send_action {
+            self.send_message(is_announcement);
+        }
+        if let Some(client_id) = login_action {
+            self.handle_login_action(client_id);
+        }
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+}
+
+impl LiveNAC {
+    fn handle_message(&mut self, msg: UiMessage) {
+        match msg {
+            UiMessage::ConfigLoaded(config_result) => {
+                self.handle_config_loaded(config_result)
+            }
+            UiMessage::Auth(auth_message) => self.handle_auth_message(auth_message),
+            UiMessage::Chat(chat_message) => self.handle_chat_message(chat_message),
+        }
+    }
+
+    fn handle_config_loaded(&mut self, result: Result<config::Config, eyre::Report>) {
+        match result {
+            Ok(config) => {
+                let client_id = config.client_id.clone();
+                self.config = config;
+                if let Some(id) = client_id {
+                    self.start_authentication(id);
+                } else {
+                    self.state = AppState::FirstTimeSetup {
+                        client_id_input: String::new(),
+                        error: None,
+                    };
+                }
+            }
+            Err(e) => self.state = AppState::FirstTimeSetup {
+                client_id_input: String::new(),
+                error: Some(format!("Failed to load config: {}", e)),
+            },
+        }
+    }
+
+    fn handle_auth_message(&mut self, msg: AuthMessage) {
+        if let AppState::Authenticating { .. } = &mut self.state {
             match msg {
                 AuthMessage::AwaitingDeviceActivation { uri, user_code } => {
-                    if let AppState::LoggedOut {
-                        status_message,
-                        device_flow_info,
-                        ..
-                    } = &mut self.state
-                    {
-                        *status_message = "Go to the URL and enter the code.".to_string();
+                    if let AppState::Authenticating { status_message, device_flow_info } = &mut self.state {
+                        *status_message = "Please authorize in your browser.".to_string();
                         *device_flow_info = Some(DeviceFlowInfo { uri, user_code });
                     }
                 }
@@ -108,25 +175,18 @@ impl eframe::App for LiveNAC {
                         chat_client: ChatClient::new(),
                         send_in_progress: false,
                         last_error: None,
+                        eventsub_task: None,
                     };
                 }
-                AuthMessage::Error(err) => {
-                    if let AppState::LoggedOut {
-                        status_message,
-                        login_started,
-                        device_flow_info,
-                        ..
-                    } = &mut self.state
-                    {
-                        *status_message = format!("Error: {}", err);
-                        *login_started = false;
-                        *device_flow_info = None;
-                    }
-                }
+                AuthMessage::Error(err) => self.state = AppState::FirstTimeSetup {
+                    client_id_input: String::new(),
+                    error: Some(format!("Authentication Failed: {}", err)),
+                },
             }
         }
+    }
 
-        // --- Handle Chat UI Messages ---
+    fn handle_chat_message(&mut self, msg: ChatUiMessage) {
         if let AppState::LoggedIn {
             chat_messages,
             send_in_progress,
@@ -135,106 +195,143 @@ impl eframe::App for LiveNAC {
             ..
         } = &mut self.state
         {
-            while let Ok(msg) = self.chat_ui_message_rx.try_recv() {
-                match msg {
-                    ChatUiMessage::NewChatMessage(message) => {
-                        chat_messages.push(message);
-                        if chat_messages.len() > 100 {
-                            chat_messages.remove(0);
-                        }
-                    }
-                    ChatUiMessage::MessageSent => {
-                        *send_in_progress = false;
-                        message_to_send.clear();
-                    }
-                    ChatUiMessage::MessageSendError(err) => {
-                        *send_in_progress = false;
-                        *last_error = Some(err);
-                    }
-                    ChatUiMessage::EventSubError(err) => {
-                        *last_error = Some(format!("Chat connection error: {}", err));
-                    }
+            match msg {
+                ChatUiMessage::NewChatMessage(message) => chat_messages.push(message),
+                ChatUiMessage::MessageSent => {
+                    *send_in_progress = false;
+                    message_to_send.clear();
+                }
+                ChatUiMessage::MessageSendError(err) => {
+                    *send_in_progress = false;
+                    *last_error = Some(err);
+                }
+                ChatUiMessage::EventSubError(err) => {
+                    *last_error = Some(format!("Chat connection error: {}", err));
                 }
             }
+            if chat_messages.len() > 200 {
+                chat_messages.remove(0);
+            }
         }
-
-        // --- Draw the UI ---
-        // This is deferred until after the UI is drawn to avoid borrow checker errors.
-        let mut send_action: Option<bool> = None;
-
-        match &mut self.state {
-            AppState::LoggedOut { .. } => self.draw_logged_out(ctx),
-            AppState::LoggedIn { .. } => self.draw_logged_in(ctx, &mut send_action),
-        }
-
-        if let Some(is_announcement) = send_action {
-            self.send_message(is_announcement);
-        }
-
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
-}
 
-impl LiveNAC {
-    fn draw_logged_out(&mut self, ctx: &egui::Context) {
-        if let AppState::LoggedOut {
+    fn handle_login_action(&mut self, client_id: String) {
+        self.config.client_id = Some(client_id.clone());
+        let config_to_save = self.config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = config::save(&config_to_save).await {
+                tracing::error!("Failed to save config: {}", e);
+            }
+        });
+        self.start_authentication(client_id);
+    }
+
+    fn start_authentication(&mut self, client_id: String) {
+        self.state = AppState::Authenticating {
+            status_message: "Logging in...".to_string(),
+            device_flow_info: None,
+        };
+        let tx = self.ui_message_tx.clone();
+        tokio::spawn(async move {
+            match AuthClient::new(client_id, tx.clone()) {
+                Ok(auth_client) => auth_client.get_or_refresh_token().await,
+                Err(e) => {
+                    let _ = tx
+                        .send(UiMessage::Auth(AuthMessage::Error(format!(
+                            "Initialization failed: {}",
+                            e
+                        ))))
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn apply_settings(&mut self, ctx: &egui::Context) {
+        let mut style = (*ctx.style()).clone();
+        let mut fonts = FontDefinitions::default();
+
+        if self.config.enable_cjk_font {
+            fonts
+                .families
+                .entry(FontFamily::Proportional)
+                .or_default()
+                .insert(0, "Noto Sans CJK JP".to_owned());
+        }
+
+        style.text_styles.iter_mut().for_each(|(_, font_id)| {
+            font_id.size = self.config.font_size;
+        });
+        
+        ctx.set_style(style);
+
+        if self.last_applied_font_size != self.config.font_size {
+            ctx.set_fonts(fonts);
+            self.last_applied_font_size = self.config.font_size;
+        }
+    }
+
+    fn draw_loading_ui(&self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.centered_and_justified(|ui| ui.spinner());
+        });
+    }
+
+    fn draw_first_time_setup(
+        &mut self,
+        ctx: &egui::Context,
+        login_action: &mut Option<String>,
+    ) {
+        if let AppState::FirstTimeSetup {
             client_id_input,
-            status_message,
-            device_flow_info,
-            login_started,
+            error,
         } = &mut self.state
         {
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading("LiveNAC: Twitch Chat Client");
-                ui.add_space(20.0);
-                ui.label(status_message.as_str());
-                ui.add_space(10.0);
+                ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                    ui.add_space(ui.available_height() * 0.2);
+                    ui.heading("LiveNAC");
+                    ui.label("Twitch Chat Client");
+                });
+                ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+                    ui.add_space(ui.available_height() * 0.4);
+                    if ui.button("Login").clicked() && !client_id_input.is_empty() {
+                        *login_action = Some(client_id_input.clone());
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(client_id_input)
+                            .hint_text("Enter your Twitch Client ID here"),
+                    );
+                    if let Some(err) = error {
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
+                });
+            });
+        }
+    }
 
-                if let Some(info) = &device_flow_info {
-                    ui.heading("Login to Twitch");
-                    ui.label("Please go to the following URL in your browser:");
-                    ui.hyperlink(&info.uri);
-                    ui.add_space(10.0);
-                    ui.label("And enter this code:");
-                    ui.heading(&info.user_code);
-                    ui.add_space(10.0);
-                    ui.spinner();
-                } else {
-                    ui.label("Twitch Application Client ID:");
-                    ui.text_edit_singleline(client_id_input);
-
-                    let is_ready_to_login =
-                        !client_id_input.trim().is_empty() && !*login_started;
-
-                    ui.add_enabled_ui(is_ready_to_login, |ui| {
-                        if ui.button("Login to Twitch").clicked() {
-                            *login_started = true;
-                            *status_message = "Attempting to log in...".to_string();
-
-                            let client_id = client_id_input.trim().to_string();
-                            let auth_tx = self.auth_message_tx.clone();
-                            let runtime_handle = self.tokio_runtime_handle.clone();
-
-                            self.tokio_runtime_handle.spawn(async move {
-                                match AuthClient::new(client_id, auth_tx.clone()) {
-                                    Ok(auth_client) => {
-                                        runtime_handle.spawn(async move {
-                                            auth_client.get_or_refresh_token().await;
-                                        });
-                                    }
-                                    Err(e) => {
-                                        let _ = auth_tx
-                                            .send(AuthMessage::Error(format!(
-                                                "Initialization failed: {}",
-                                                e
-                                            )))
-                                            .await;
-                                    }
-                                }
-                            });
-                        }
-                    });
-                }
+    fn draw_authenticating_ui(&self, ctx: &egui::Context) {
+        if let AppState::Authenticating {
+            device_flow_info, ..
+        } = &self.state
+        {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.centered_and_justified(|ui| {
+                    if let Some(info) = device_flow_info {
+                        ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                            ui.heading("Login to Twitch");
+                            ui.label("Please go to the following URL in your browser:");
+                            ui.hyperlink(&info.uri);
+                            ui.add_space(10.0);
+                            ui.label("And enter this code:");
+                            ui.heading(&info.user_code);
+                            ui.add_space(10.0);
+                            ui.spinner();
+                        });
+                    } else {
+                        ui.spinner();
+                    }
+                });
             });
         }
     }
@@ -250,54 +347,108 @@ impl LiveNAC {
             last_error,
             token,
             user_id,
-            chat_client,
+            eventsub_task,
+            ..
         } = &mut self.state
         {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.heading(format!("Logged in as {}", user_login));
-                ui.add_space(10.0);
+            TopBottomPanel::top("top_panel").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("☰").clicked() {
+                        self.show_toolbar = !self.show_toolbar;
+                    }
+                    ui.heading(format!("Logged in as {}", user_login));
+                });
 
-                // Channel joining section
+                if self.show_toolbar {
+                    MenuBar::new().ui(ui, |ui| {
+                        ui.menu_button("File", |ui| {
+                            if ui.button("Settings").clicked() {
+                                self.show_settings_window = true;
+                                ui.close();
+                            }
+                            if ui.button("Exit").clicked() {
+                                std::process::exit(0);
+                            }
+                        });
+                    });
+                }
+
+                ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Channel:");
-                    ui.text_edit_singleline(channel_to_join);
-                    if ui.button("Join").clicked() && !channel_to_join.is_empty() {
+                    let response = ui.text_edit_singleline(channel_to_join);
+                    let join_clicked = ui.button("Join").clicked();
+                    let enter_pressed =
+                        response.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter));
+                    if (join_clicked || enter_pressed) && !channel_to_join.is_empty() {
+                        if let Some(task) = eventsub_task.take() {
+                            task.abort();
+                        }
+                        chat_messages.clear();
                         *current_channel = Some(channel_to_join.clone());
-                        let chat_ui_tx = self.chat_ui_message_tx.clone();
+                        let tx = self.ui_message_tx.clone();
                         let token = token.clone();
-                        let channel_login = channel_to_join.clone();
                         let user_id = user_id.clone();
-                        let chat_client = chat_client.clone();
-
-                        self.tokio_runtime_handle.spawn(async move {
+                        let channel_login = channel_to_join.clone();
+                        *eventsub_task = Some(tokio::spawn(async move {
+                            let chat_client = ChatClient::new();
                             match chat_client.get_user_id(&channel_login, &token).await {
-                                Ok(Some(broadcaster_id)) => {
+                                Ok(Some(id)) => {
                                     let eventsub_client =
-                                        EventSubClient::new(user_id, token, chat_ui_tx);
-                                    if let Err(e) = eventsub_client.run(broadcaster_id).await {
+                                        EventSubClient::new(user_id, token, tx, id);
+                                    if let Err(e) = eventsub_client.run().await {
                                         tracing::error!("EventSub client failed: {}", e);
                                     }
                                 }
                                 _ => {
-                                    let _ = chat_ui_tx
-                                        .send(ChatUiMessage::EventSubError(
+                                    let _ = tx
+                                        .send(UiMessage::Chat(ChatUiMessage::EventSubError(
                                             "Channel not found".to_string(),
-                                        ))
+                                        )))
                                         .await;
                                 }
                             }
-                        });
+                        }));
                     }
                 });
-
                 ui.label(format!(
                     "Current Channel: {}",
                     current_channel.as_deref().unwrap_or("None")
                 ));
+            });
 
-                // Chat messages area
-                ui.add_space(10.0);
-                ui.separator();
+            TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(message_to_send)
+                            .hint_text("Enter message..."),
+                    );
+                    let enter_pressed =
+                        response.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter));
+                    let can_send = !message_to_send.is_empty()
+                        && current_channel.is_some()
+                        && !*send_in_progress;
+                    if ui.add_enabled(can_send, egui::Button::new("Send")).clicked()
+                        || (enter_pressed && can_send)
+                    {
+                        *send_action = Some(false);
+                    }
+                    if ui
+                        .add_enabled(can_send, egui::Button::new("Announce"))
+                        .clicked()
+                    {
+                        *send_action = Some(true);
+                    }
+                    if *send_in_progress {
+                        ui.spinner();
+                    }
+                });
+                if let Some(error) = last_error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+            });
+
+            egui::CentralPanel::default().show(ctx, |ui| {
                 ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
@@ -306,37 +457,39 @@ impl LiveNAC {
                             ui.label(message);
                         }
                     });
+            });
 
-                // Message input section
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(message_to_send);
+            self.draw_settings_window(ctx);
+        }
+    }
 
-                    let can_send = !message_to_send.is_empty()
-                        && current_channel.is_some()
-                        && !*send_in_progress;
+    fn draw_settings_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("Settings")
+            .open(&mut self.show_settings_window)
+            .show(ctx, |ui| {
+                ui.heading("Appearance");
+                let mut config_changed = false;
+                config_changed |= ui
+                    .checkbox(&mut self.config.enable_cjk_font, "Enable CJK Font Support")
+                    .changed();
+                if self.config.enable_cjk_font {
+                    ui.label("Note: Requires a font like 'Noto Sans CJK JP' to be installed on your system.");
+                    ui.hyperlink_to("Download Noto Sans CJK from Google Fonts", "https://fonts.google.com/noto/specimen/Noto+Sans+JP");
+                }
 
-                    let send_button = ui.add_enabled(can_send, egui::Button::new("Send"));
-                    if send_button.clicked() {
-                        *send_action = Some(false);
-                    }
+                config_changed |= ui
+                    .add(egui::Slider::new(&mut self.config.font_size, 8.0..=24.0).text("Font Size"))
+                    .changed();
 
-                    let send_announcement_button =
-                        ui.add_enabled(can_send, egui::Button::new("Send Announcement"));
-                    if send_announcement_button.clicked() {
-                        *send_action = Some(true);
-                    }
-
-                    if *send_in_progress {
-                        ui.spinner();
-                    }
-                });
-
-                if let Some(error) = last_error {
-                    ui.label(egui::RichText::new(error.as_str()).color(egui::Color32::RED));
+                if config_changed {
+                    let config_to_save = self.config.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = config::save(&config_to_save).await {
+                            tracing::error!("Failed to save config: {}", e);
+                        }
+                    });
                 }
             });
-        }
     }
 
     fn send_message(&mut self, is_announcement: bool) {
@@ -354,26 +507,23 @@ impl LiveNAC {
             if let Some(channel) = current_channel.clone() {
                 *send_in_progress = true;
                 *last_error = None;
-
                 let token = token.clone();
                 let user_id = user_id.clone();
                 let chat_client = chat_client.clone();
-                let ui_tx = self.chat_ui_message_tx.clone();
+                let tx = self.ui_message_tx.clone();
                 let message = message_to_send.clone();
-
-                self.tokio_runtime_handle.spawn(async move {
+                tokio::spawn(async move {
                     let broadcaster_id = match chat_client.get_user_id(&channel, &token).await {
                         Ok(Some(id)) => id,
                         _ => {
-                            let _ = ui_tx
-                                .send(ChatUiMessage::MessageSendError(
+                            let _ = tx
+                                .send(UiMessage::Chat(ChatUiMessage::MessageSendError(
                                     "Channel not found".to_string(),
-                                ))
+                                )))
                                 .await;
                             return;
                         }
                     };
-
                     let result = if is_announcement {
                         chat_client
                             .send_announcement(
@@ -394,20 +544,14 @@ impl LiveNAC {
                             )
                             .await
                     };
-
-                    match result {
-                        Ok(_) => {
-                            let _ = ui_tx.send(ChatUiMessage::MessageSent).await;
-                        }
-                        Err(e) => {
-                            let _ = ui_tx
-                                .send(ChatUiMessage::MessageSendError(format!(
-                                    "Failed to send: {}",
-                                    e
-                                )))
-                                .await;
-                        }
-                    }
+                    let _ = match result {
+                        Ok(_) => tx.send(UiMessage::Chat(ChatUiMessage::MessageSent)).await,
+                        Err(e) => tx
+                            .send(UiMessage::Chat(ChatUiMessage::MessageSendError(
+                                format!("Failed to send: {}", e),
+                            )))
+                            .await,
+                    };
                 });
             }
         }

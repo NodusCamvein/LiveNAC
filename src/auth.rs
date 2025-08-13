@@ -1,3 +1,4 @@
+use crate::ui::UiMessage;
 use dirs;
 use eyre::{eyre, Context};
 use reqwest::Client as ReqwestClient;
@@ -35,13 +36,13 @@ pub struct AuthClient {
     scopes: Vec<twitch_oauth2::Scope>,
     client_id: twitch_oauth2::ClientId,
     data_path: PathBuf,
-    auth_message_tx: mpsc::Sender<AuthMessage>,
+    ui_message_tx: mpsc::Sender<UiMessage>, // Changed
 }
 
 impl AuthClient {
     pub fn new(
         client_id: String,
-        auth_message_tx: mpsc::Sender<AuthMessage>,
+        ui_message_tx: mpsc::Sender<UiMessage>, // Changed
     ) -> Result<Self, eyre::Report> {
         let reqwest_client = ReqwestClient::builder()
             .user_agent(APP_USER_AGENT)
@@ -69,7 +70,7 @@ impl AuthClient {
             scopes,
             client_id: twitch_oauth2::ClientId::new(client_id),
             data_path,
-            auth_message_tx,
+            ui_message_tx,
         })
     }
 
@@ -79,7 +80,7 @@ impl AuthClient {
         match self.load_and_validate_token().await {
             Ok(token) => {
                 tracing::info!("Successfully loaded and validated a token.");
-                let _ = self.save_token_to_disk(&token).await; // Save the potentially refreshed token
+                let _ = self.save_token_to_disk(&token).await;
                 self.send_message(AuthMessage::Success(token)).await;
             }
             Err(e) => {
@@ -106,7 +107,7 @@ impl AuthClient {
             stored.access_token,
             stored.refresh_token,
             self.client_id.clone(),
-            None, // No client secret for public clients
+            None,
         )
         .await
         .context("Failed to validate or refresh token")?;
@@ -125,12 +126,6 @@ impl AuthClient {
             .start(&self.reqwest_client)
             .await
             .context("Failed to start device flow")?;
-
-        tracing::info!(
-            "Device flow started. URI: {}, Code: {}",
-            code.verification_uri,
-            code.user_code
-        );
 
         self.send_message(AuthMessage::AwaitingDeviceActivation {
             uri: code.verification_uri.clone(),
@@ -154,7 +149,6 @@ impl AuthClient {
     /// Saves the UserToken to a file on disk asynchronously.
     async fn save_token_to_disk(&self, token: &UserToken) -> Result<(), eyre::Report> {
         let path = self.data_path.join(TOKEN_FILE_NAME);
-        tracing::info!("Saving token to {:?}", path);
         let stored_token = StoredToken {
             access_token: token.access_token.clone(),
             refresh_token: token
@@ -162,48 +156,30 @@ impl AuthClient {
                 .clone()
                 .ok_or_else(|| eyre!("Cannot save a token without a refresh token"))?,
         };
-
-        let bytes = serde_json::to_vec_pretty(&stored_token)
-            .context("Failed to serialize token")?;
-
-        if !self.data_path.exists() {
-            tokio::fs::create_dir_all(&self.data_path).await.context("Failed to create config directory")?;
+        let bytes = serde_json::to_vec_pretty(&stored_token)?;
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
         }
-        
-        let mut file = tokio::fs::File::create(path)
-            .await
-            .context("Failed to create token file")?;
-
-        file.write_all(&bytes)
-            .await
-            .context("Failed to write token to file")?;
-
+        let mut file = tokio::fs::File::create(path).await?;
+        file.write_all(&bytes).await?;
         Ok(())
     }
 
     /// Loads a UserToken from a file on disk asynchronously.
     async fn load_token_from_disk(&self) -> Result<StoredToken, eyre::Report> {
         let path = self.data_path.join(TOKEN_FILE_NAME);
-        tracing::info!("Loading token from {:?}", path);
-
-        let mut file = tokio::fs::File::open(path)
-            .await
-            .context("Could not open token file")?;
-
+        let mut file = tokio::fs::File::open(path).await?;
         let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)
-            .await
-            .context("Could not read token file")?;
-
-        let token: StoredToken =
-            serde_json::from_slice(&buffer).context("Could not parse token file")?;
-
+        file.read_to_end(&mut buffer).await?;
+        let token: StoredToken = serde_json::from_slice(&buffer)?;
         Ok(token)
     }
 
     /// Helper to send a message to the UI thread.
     async fn send_message(&self, msg: AuthMessage) {
-        if self.auth_message_tx.send(msg).await.is_err() {
+        if self.ui_message_tx.send(UiMessage::Auth(msg)).await.is_err() {
             tracing::error!("Failed to send message to UI thread: channel is closed.");
         }
     }

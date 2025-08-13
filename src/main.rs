@@ -1,13 +1,14 @@
 mod auth;
 mod chat;
+mod config;
 mod eventsub;
 mod ui;
 
 use eframe::NativeOptions;
-use tokio::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
 
-fn main() -> eframe::Result<()> {
+#[tokio::main]
+async fn main() -> eframe::Result<()> {
     // Setup file-based logging
     let file_appender = tracing_appender::rolling::never(".", "livenac.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
@@ -16,14 +17,12 @@ fn main() -> eframe::Result<()> {
         .with_writer(non_blocking)
         .init();
 
-    let runtime = Runtime::new().expect("Failed to create Tokio runtime");
-
     let native_options = NativeOptions::default();
     eframe::run_native(
         "LiveNAC",
         native_options,
-        Box::new(move |cc| {
-            let app = ui::LiveNAC::new(cc, runtime.handle().clone());
+        Box::new(|cc| {
+            let app = ui::LiveNAC::new(cc);
             Ok(Box::new(app))
         }),
     )
