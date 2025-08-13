@@ -3,6 +3,7 @@ use eyre::{eyre, Context};
 use reqwest::Client as ReqwestClient;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use twitch_oauth2::{DeviceUserTokenBuilder, UserToken};
 
@@ -78,7 +79,7 @@ impl AuthClient {
         match self.load_and_validate_token().await {
             Ok(token) => {
                 tracing::info!("Successfully loaded and validated a token.");
-                let _ = self.save_token_to_disk(&token); // Save the potentially refreshed token
+                let _ = self.save_token_to_disk(&token).await; // Save the potentially refreshed token
                 self.send_message(AuthMessage::Success(token)).await;
             }
             Err(e) => {
@@ -98,8 +99,8 @@ impl AuthClient {
     /// Tries to load a token from disk and validate it. Refreshes if expired.
     async fn load_and_validate_token(&self) -> Result<UserToken, eyre::Report> {
         tracing::info!("Attempting to load token from disk...");
-        let stored = self.load_token_from_disk()?;
-        
+        let stored = self.load_token_from_disk().await?;
+
         let token = UserToken::from_existing_or_refresh_token(
             &self.reqwest_client,
             stored.access_token,
@@ -109,7 +110,7 @@ impl AuthClient {
         )
         .await
         .context("Failed to validate or refresh token")?;
-        
+
         tracing::info!("Token is valid.");
         Ok(token)
     }
@@ -143,15 +144,15 @@ impl AuthClient {
             .context("Failed to get token from device flow")?;
         tracing::info!("Successfully received token from device flow.");
 
-        self.save_token_to_disk(&token)?;
+        self.save_token_to_disk(&token).await?;
 
         self.send_message(AuthMessage::Success(token)).await;
 
         Ok(())
     }
 
-    /// Saves the UserToken to a file on disk.
-    fn save_token_to_disk(&self, token: &UserToken) -> Result<(), eyre::Report> {
+    /// Saves the UserToken to a file on disk asynchronously.
+    async fn save_token_to_disk(&self, token: &UserToken) -> Result<(), eyre::Report> {
         let path = self.data_path.join(TOKEN_FILE_NAME);
         tracing::info!("Saving token to {:?}", path);
         let stored_token = StoredToken {
@@ -162,19 +163,41 @@ impl AuthClient {
                 .ok_or_else(|| eyre!("Cannot save a token without a refresh token"))?,
         };
 
-        let file = std::fs::File::create(path).context("Failed to create token file")?;
-        serde_json::to_writer_pretty(file, &stored_token)
+        let bytes = serde_json::to_vec_pretty(&stored_token)
+            .context("Failed to serialize token")?;
+
+        if !self.data_path.exists() {
+            tokio::fs::create_dir_all(&self.data_path).await.context("Failed to create config directory")?;
+        }
+        
+        let mut file = tokio::fs::File::create(path)
+            .await
+            .context("Failed to create token file")?;
+
+        file.write_all(&bytes)
+            .await
             .context("Failed to write token to file")?;
+
         Ok(())
     }
 
-    /// Loads a UserToken from a file on disk.
-    fn load_token_from_disk(&self) -> Result<StoredToken, eyre::Report> {
+    /// Loads a UserToken from a file on disk asynchronously.
+    async fn load_token_from_disk(&self) -> Result<StoredToken, eyre::Report> {
         let path = self.data_path.join(TOKEN_FILE_NAME);
         tracing::info!("Loading token from {:?}", path);
-        let file = std::fs::File::open(path).context("Could not open token file")?;
+
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .context("Could not open token file")?;
+
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)
+            .await
+            .context("Could not read token file")?;
+
         let token: StoredToken =
-            serde_json::from_reader(file).context("Could not parse token file")?;
+            serde_json::from_slice(&buffer).context("Could not parse token file")?;
+
         Ok(token)
     }
 
