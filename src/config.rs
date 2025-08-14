@@ -1,19 +1,8 @@
-//! Handles loading and saving of application configuration.
-//!
-//! The `Config` struct is the main entry point for application settings.
-//! It is designed to be easily extensible. To add a new setting, you can
-//! simply add a new field to the `Config` struct.
-//!
-//! The configuration is saved in a `config.json` file in the user's
-//! config directory (e.g., `~/.config/livenac/` on Linux).
-
 use eyre::{eyre, Context};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Represents the application's configuration.
-///
 /// To add a new configuration option (e.g., a list of favorite channels):
 /// 1. Add a new field to this struct:
 ///    ```
@@ -52,8 +41,6 @@ fn get_config_path() -> Result<PathBuf, eyre::Report> {
 }
 
 /// Asynchronously loads the application configuration from disk.
-///
-/// If the file does not exist, it returns the default configuration.
 pub async fn load() -> Result<Config, eyre::Report> {
     let path = get_config_path()?;
     tracing::info!("Loading config from {:?}", path);

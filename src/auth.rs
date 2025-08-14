@@ -11,14 +11,12 @@ use twitch_oauth2::{DeviceUserTokenBuilder, UserToken};
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const TOKEN_FILE_NAME: &str = "token.json";
 
-/// A message from the auth task to the UI thread.
 #[derive(Debug)]
 pub enum AuthMessage {
+    /// A message from the auth task to the UI thread.
     /// Prompt the user to authorize with the given URI and code.
     AwaitingDeviceActivation { uri: String, user_code: String },
-    /// Authentication was successful.
     Success(UserToken),
-    /// An error occurred.
     Error(String),
 }
 
@@ -36,13 +34,13 @@ pub struct AuthClient {
     scopes: Vec<twitch_oauth2::Scope>,
     client_id: twitch_oauth2::ClientId,
     data_path: PathBuf,
-    ui_message_tx: mpsc::Sender<UiMessage>, // Changed
+    ui_message_tx: mpsc::Sender<UiMessage>,
 }
 
 impl AuthClient {
     pub fn new(
         client_id: String,
-        ui_message_tx: mpsc::Sender<UiMessage>, // Changed
+        ui_message_tx: mpsc::Sender<UiMessage>,
     ) -> Result<Self, eyre::Report> {
         let reqwest_client = ReqwestClient::builder()
             .user_agent(APP_USER_AGENT)
