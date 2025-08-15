@@ -5,4 +5,5 @@ pub mod events;
 pub mod features;
 pub mod models;
 pub mod services;
+pub mod ui;
 pub mod utils;
