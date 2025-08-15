@@ -1,10 +1,5 @@
-mod auth;
-mod chat;
-mod config;
-mod eventsub;
-mod ui;
-
 use eframe::NativeOptions;
+use livenac::ui::app_layout::App;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -18,10 +13,10 @@ async fn main() -> eframe::Result<()> {
 
     let native_options = NativeOptions::default();
     eframe::run_native(
-        "LiveNAC",
+        "livenac",
         native_options,
         Box::new(|cc| {
-            let app = ui::LiveNAC::new(cc);
+            let app = App::new(cc);
             Ok(Box::new(app))
         }),
     )
