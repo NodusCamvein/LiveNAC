@@ -1,5 +1,8 @@
-use crate::core::chat::ChatClient;
-use std::sync::Arc;
+use crate::{
+    core::chat::ChatClient,
+    models::{message::ChatMessage, user::User},
+};
+use std::{collections::HashSet, sync::Arc};
 use tokio::task::JoinHandle;
 use twitch_oauth2::UserToken;
 use twitch_types::UserId;
@@ -29,7 +32,8 @@ pub enum AppState {
         channel_to_join: String,
         current_channel: Option<String>,
         message_to_send: String,
-        chat_messages: Vec<String>,
+        chat_messages: Vec<ChatMessage>,
+        users: HashSet<User>,
         chat_client: ChatClient,
         send_in_progress: bool,
         last_error: Option<String>,

@@ -1,5 +1,4 @@
-use crate::app::config::Config;
-use crate::core::auth::AuthMessage;
+use crate::{app::config::Config, core::auth::AuthMessage, models::message::ChatMessage};
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -10,7 +9,7 @@ pub enum AppEvent {
 
 #[derive(Debug)]
 pub enum ChatEvent {
-    NewChatMessage(String),
+    NewChatMessage(ChatMessage),
     MessageSent,
     MessageSendError(String),
     EventSubError(String),

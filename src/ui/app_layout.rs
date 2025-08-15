@@ -1,13 +1,20 @@
-use crate::app::config::{self, Config};
-use crate::app::reducer;
-use crate::app::state::AppState;
-use crate::core::auth::AuthClient;
-use crate::core::chat::{AnnouncementColor, ChatClient};
-use crate::core::eventsub::EventSubClient;
-use crate::events::app_event::{AppEvent, ChatEvent};
-use crate::ui::chat_bar;
-use crate::ui::chat_log;
-use eframe::egui::{self, Align, FontDefinitions, FontFamily, Key, Layout, TopBottomPanel};
+use crate::{
+    app::{
+        config::{self, Config},
+        reducer,
+        state::AppState,
+    },
+    core::{
+        auth::AuthClient,
+        chat::{AnnouncementColor, ChatClient},
+        eventsub::EventSubClient,
+    },
+    events::app_event::{AppEvent, ChatEvent},
+    ui::{chat_bar, chat_log, emote_picker, user_list},
+};
+use eframe::egui::{
+    self, Align, FontDefinitions, FontFamily, Key, Layout, SidePanel, TopBottomPanel,
+};
 use tokio::sync::mpsc;
 
 pub struct App {
@@ -17,6 +24,7 @@ pub struct App {
     config: Config,
     show_settings_window: bool,
     show_toolbar: bool,
+    show_emote_picker: bool,
     last_applied_font_size: f32,
 }
 
@@ -38,6 +46,7 @@ impl App {
             config: default_config.clone(),
             show_settings_window: false,
             show_toolbar: false,
+            show_emote_picker: false,
             last_applied_font_size: default_config.font_size,
         }
     }
@@ -269,8 +278,19 @@ impl App {
             });
 
             TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
-                chat_bar::draw_chat_bar(ui, &mut self.state, send_action);
+                if self.show_emote_picker {
+                    emote_picker::draw_emote_picker(ui, &mut self.state);
+                    ui.separator();
+                }
+                chat_bar::draw_chat_bar(ui, &mut self.state, send_action, &mut self.show_emote_picker);
             });
+
+            SidePanel::right("user_list_panel")
+                .min_width(150.0)
+                .default_width(180.0)
+                .show(ctx, |ui| {
+                    user_list::draw_user_list(ui, &mut self.state);
+                });
 
             egui::CentralPanel::default().show(ctx, |ui| {
                 chat_log::draw_chat_log(ui, &mut self.state);

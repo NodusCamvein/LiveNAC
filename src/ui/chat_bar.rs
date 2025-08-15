@@ -1,7 +1,12 @@
 use crate::app::state::AppState;
 use eframe::egui;
 
-pub fn draw_chat_bar(ui: &mut egui::Ui, state: &mut AppState, send_action: &mut Option<bool>) {
+pub fn draw_chat_bar(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    send_action: &mut Option<bool>,
+    show_emote_picker: &mut bool,
+) {
     if let AppState::LoggedIn {
         message_to_send,
         current_channel,
@@ -11,6 +16,9 @@ pub fn draw_chat_bar(ui: &mut egui::Ui, state: &mut AppState, send_action: &mut 
     } = state
     {
         ui.horizontal(|ui| {
+            if ui.button("😀").clicked() {
+                *show_emote_picker = !*show_emote_picker;
+            }
             let response =
                 ui.add(egui::TextEdit::singleline(message_to_send).hint_text("Enter message..."));
             let enter_pressed =

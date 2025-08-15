@@ -1,4 +1,11 @@
-use crate::events::app_event::{AppEvent, ChatEvent};
+use crate::{
+    events::app_event::{AppEvent, ChatEvent},
+    models::{
+        emote::{Emote, EmoteSource},
+        message::{ChatMessage, MessageFragment},
+    },
+};
+use chrono::Utc;
 use eyre::eyre;
 use futures::StreamExt;
 use reqwest::Client as ReqwestClient;
@@ -6,13 +13,15 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use twitch_api::{
-    HelixClient,
     eventsub::{
-        Event, Message, Transport,
         channel::ChannelChatMessageV1,
         event::websocket::{EventsubWebsocketData, WelcomePayload},
+        Event, Message, Transport,
     },
-    helix::eventsub::{CreateEventSubSubscriptionBody, CreateEventSubSubscriptionRequest},
+    helix::eventsub::{
+        CreateEventSubSubscriptionBody, CreateEventSubSubscriptionRequest,
+    },
+    HelixClient,
 };
 use twitch_oauth2::UserToken;
 use twitch_types::UserId;
@@ -129,13 +138,16 @@ impl EventSubClient {
 
         let subscription = self
             .helix_client
-            .req_post(CreateEventSubSubscriptionRequest::new(), body, &*self.token)
+            .req_post(
+                CreateEventSubSubscriptionRequest::new(),
+                body.into(),
+                &*self.token,
+            )
             .await?;
 
         tracing::info!(
             "Created subscription: {:?}, status: {:?}",
-            subscription.data.type_,
-            subscription.data.status
+            subscription.data.type_, subscription.data.status
         );
         Ok(())
     }
@@ -143,26 +155,51 @@ impl EventSubClient {
     async fn handle_notification(&self, notification: Event) {
         if let Event::ChannelChatMessageV1(payload) = notification {
             if let Message::Notification(event_data) = payload.message {
-                let message_text = &event_data.message.text;
-                let chatter_login = &event_data.chatter_user_login;
-                let chatter_display_name = &event_data.chatter_user_name;
+                let chatter_display_name = event_data.chatter_user_name;
 
-                // Conditionally format the message. If the display name is plain ASCII,
-                // or just a different capitalization of the login name, don't show the login name.
-                // Otherwise, show both for clarity (e.g., for CJK names).
-                let formatted_message = if chatter_display_name
-                    .as_str()
-                    .eq_ignore_ascii_case(chatter_login.as_str())
+                let sender_color = if !event_data.color.as_str().is_empty()
+                    && event_data.color.as_str().len() == 7
+                    && event_data.color.as_str().starts_with('#')
                 {
-                    format!("{}: {}", chatter_display_name, message_text)
+                    let r = u8::from_str_radix(&event_data.color.as_str()[1..3], 16).unwrap_or(255);
+                    let g = u8::from_str_radix(&event_data.color.as_str()[3..5], 16).unwrap_or(255);
+                    let b = u8::from_str_radix(&event_data.color.as_str()[5..7], 16).unwrap_or(255);
+                    Some((r, g, b))
                 } else {
-                    format!(
-                        "{} ({}): {}",
-                        chatter_display_name, chatter_login, message_text
-                    )
+                    None
                 };
 
-                let msg = AppEvent::Chat(ChatEvent::NewChatMessage(formatted_message));
+                let mut fragments = Vec::new();
+                for fragment in &event_data.message.fragments {
+                    match fragment {
+                        twitch_api::eventsub::channel::chat::Fragment::Text { text } => {
+                            fragments.push(MessageFragment::Text(text.to_string()));
+                        }
+                        twitch_api::eventsub::channel::chat::Fragment::Emote { text, emote } => {
+                            let emote_url = format!(
+                                "https://static-cdn.jtvnw.net/emoticons/v2/{}/default/dark/1.0",
+                                emote.id
+                            );
+                            fragments.push(MessageFragment::Emote(Emote {
+                                name: text.to_string(),
+                                url: emote_url,
+                                source: EmoteSource::Twitch,
+                            }));
+                        }
+                        _ => {
+                            // TODO: Maybe log this
+                        }
+                    }
+                }
+
+                let message = ChatMessage {
+                    sender_name: chatter_display_name.to_string(),
+                    sender_color,
+                    fragments,
+                    timestamp: Utc::now(),
+                };
+
+                let msg = AppEvent::Chat(ChatEvent::NewChatMessage(message));
                 if self.message_tx.send(msg).await.is_err() {
                     tracing::error!("Failed to send message to UI thread: channel is closed.");
                 }

@@ -1,9 +1,11 @@
 use super::state::{AppState, DeviceFlowInfo};
-use crate::app::config::Config;
-use crate::core::auth::AuthMessage;
-use crate::core::chat::ChatClient;
-use crate::events::app_event::{AppEvent, ChatEvent};
-use std::sync::Arc;
+use crate::{
+    app::config::Config,
+    core::{auth::AuthMessage, chat::ChatClient},
+    events::app_event::{AppEvent, ChatEvent},
+    models::user::User,
+};
+use std::{collections::HashSet, sync::Arc};
 
 pub fn reduce(state: &mut AppState, event: AppEvent) {
     match event {
@@ -70,6 +72,7 @@ fn handle_auth_message(state: &mut AppState, msg: AuthMessage) {
                     current_channel: None,
                     message_to_send: String::new(),
                     chat_messages: Vec::new(),
+                    users: HashSet::new(),
                     chat_client: ChatClient::new(),
                     send_in_progress: false,
                     last_error: None,
@@ -89,6 +92,7 @@ fn handle_auth_message(state: &mut AppState, msg: AuthMessage) {
 fn handle_chat_message(state: &mut AppState, msg: ChatEvent) {
     if let AppState::LoggedIn {
         chat_messages,
+        users,
         send_in_progress,
         last_error,
         message_to_send,
@@ -96,7 +100,14 @@ fn handle_chat_message(state: &mut AppState, msg: ChatEvent) {
     } = state
     {
         match msg {
-            ChatEvent::NewChatMessage(message) => chat_messages.push(message),
+            ChatEvent::NewChatMessage(message) => {
+                let user = User {
+                    name: message.sender_name.clone(),
+                    color: message.sender_color,
+                };
+                users.insert(user);
+                chat_messages.push(message);
+            }
             ChatEvent::MessageSent => {
                 *send_in_progress = false;
                 message_to_send.clear();
