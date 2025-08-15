@@ -3,7 +3,7 @@ use dirs;
 use eyre::{Context, eyre};
 use reqwest::Client as ReqwestClient;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use twitch_oauth2::{DeviceUserTokenBuilder, UserToken};
@@ -47,6 +47,7 @@ impl AuthClient {
     ) -> Result<Self, eyre::Report> {
         let reqwest_client = ReqwestClient::builder()
             .user_agent(APP_USER_AGENT)
+            .timeout(Duration::from_secs(15))
             .build()?;
 
         let scopes = vec![
@@ -78,7 +79,10 @@ impl AuthClient {
     /// The main entry point for authentication.
     pub async fn get_or_refresh_token(self) {
         tracing::info!("Starting token acquisition process...");
-        match self.load_and_validate_token().await {
+        let result = self.load_and_validate_token().await;
+        tracing::info!("Token validation finished. Result: {:?}", result.is_ok());
+
+        match result {
             Ok(token) => {
                 tracing::info!("Successfully loaded and validated a token.");
                 let _ = self.save_token_to_disk(&token).await;
