@@ -22,3 +22,4 @@ target
 writeup.md
 debug.md
 livenac.log
+.env
