@@ -7,7 +7,10 @@ pub fn draw_user_list(ui: &mut egui::Ui, state: &mut AppState) {
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for user in users.iter() {
+                let mut sorted_users: Vec<_> = users.iter().collect();
+                sorted_users.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+                for user in sorted_users {
                     ui.label(&user.name);
                 }
             });

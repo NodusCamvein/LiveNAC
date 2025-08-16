@@ -1,4 +1,7 @@
-use crate::{app::config::Config, core::auth::AuthMessage, models::message::ChatMessage};
+use crate::{
+    app::config::Config, core::auth::AuthMessage, emotes::twitch_api::TwitchEmote,
+    models::message::ChatMessage,
+};
 use twitch_oauth2::UserToken;
 
 #[derive(Debug)]
@@ -7,6 +10,7 @@ pub enum AppEvent {
     SilentLoginComplete(Result<UserToken, eyre::Report>),
     Auth(AuthMessage),
     Chat(ChatEvent),
+    GlobalEmotesLoaded(Result<Vec<TwitchEmote>, String>),
 }
 
 #[derive(Debug)]

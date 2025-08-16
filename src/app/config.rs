@@ -12,6 +12,7 @@ pub struct Config {
     pub client_id: Option<String>,
     pub enable_cjk_font: bool,
     pub font_size: f32,
+    pub emote_size: f32,
 }
 
 impl Default for Config {
@@ -20,6 +21,7 @@ impl Default for Config {
             client_id: None,
             enable_cjk_font: false,
             font_size: 14.0,
+            emote_size: 14.0,
         }
     }
 }

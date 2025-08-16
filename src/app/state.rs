@@ -1,5 +1,6 @@
 use crate::{
     core::chat::ChatClient,
+    emotes::twitch_api::TwitchEmote,
     models::{message::ChatMessage, user::User},
 };
 use std::{collections::HashSet, sync::Arc};
@@ -26,6 +27,7 @@ pub enum AppState {
         message_to_send: String,
         chat_messages: Vec<ChatMessage>,
         users: HashSet<User>,
+        global_emotes: Vec<TwitchEmote>,
         chat_client: ChatClient,
         send_in_progress: bool,
         last_error: Option<String>,

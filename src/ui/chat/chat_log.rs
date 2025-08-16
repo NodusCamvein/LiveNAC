@@ -1,7 +1,7 @@
 use crate::{app::state::AppState, models::message::MessageFragment};
 use eframe::egui::{self, Color32, Image, RichText, ScrollArea, Vec2};
 
-pub fn draw_chat_log(ui: &mut egui::Ui, state: &mut AppState) {
+pub fn draw_chat_log(ui: &mut egui::Ui, state: &mut AppState, emote_size: f32) {
     if let AppState::LoggedIn { chat_messages, .. } = state {
         ScrollArea::vertical()
             .stick_to_bottom(true)
@@ -25,10 +25,16 @@ pub fn draw_chat_log(ui: &mut egui::Ui, state: &mut AppState) {
                                     ui.label(text);
                                 }
                                 MessageFragment::Emote(emote) => {
-                                    ui.add(
-                                        Image::new(emote.url.as_str())
-                                            .max_size(Vec2::new(24.0, 24.0)),
-                                    );
+                                    let image = Image::new(emote.url.as_str())
+                                        .max_size(Vec2::new(emote_size, emote_size));
+
+                                    let source_text = format!("{:?}", emote.source);
+
+                                    let _response = ui.add(image.sense(egui::Sense::click()))
+                                        .on_hover_text(format!(
+                                            "{} - {}",
+                                            emote.name, source_text
+                                        ));
                                 }
                             }
                         }

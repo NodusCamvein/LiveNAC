@@ -10,9 +10,10 @@ use crate::{
         eventsub::EventSubClient,
     },
     events::app_event::{AppEvent, ChatEvent},
-    ui::{chat_bar, chat_log, emote_picker, user_list},
+    ui::chat::{chat_bar, chat_log, emote_picker, user_list},
 };
 use eframe::egui::{self, Align, FontDefinitions, Key, Layout, SidePanel, TopBottomPanel};
+use fontdb;
 use tokio::sync::mpsc;
 
 use crate::core::auth::AuthMessage;
@@ -25,30 +26,113 @@ pub struct App {
     show_settings_window: bool,
     show_toolbar: bool,
     show_emote_picker: bool,
+    show_user_list: bool,
     startup_task_spawned: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+
         let (event_tx, event_rx) = mpsc::channel(100);
         let default_config = Config::default();
 
+        // --- FONT SETUP ---
         let mut fonts = FontDefinitions::default();
 
+        /*
+        // 1. Start with the bundled font as a base.
         fonts.font_data.insert(
-            "livenac_font".to_owned(),
+            "noto_sans_jp".to_owned(),
             egui::FontData::from_static(include_bytes!(
                 "../../assets/fonts/NotoSansJP-Regular.otf"
             ))
             .into(),
         );
 
+        // Add it to the proportional family.
         fonts
             .families
             .entry(egui::FontFamily::Proportional)
             .or_default()
-            .insert(0, "livenac_font".to_owned());
+            .insert(0, "noto_sans_jp".to_owned());
+        */
 
+        // 2. Load system fonts
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+
+        // 3. Define a list of fonts to search for, in order of preference.
+        let fonts_to_load = [
+            // CJK
+            "Microsoft YaHei",
+            "PingFang SC",
+            "Noto Sans CJK SC",
+            "WenQuanYi Zen Hei",
+            "Yu Gothic",
+            "Hiragino Sans",
+            "Noto Sans CJK JP",
+            "Malgun Gothic",
+            "Apple SD Gothic Neo",
+            "Noto Sans CJK KR",
+            // Generic Fallbacks
+            "Arial",
+            "Helvetica",
+            "Cantarell",
+            "Ubuntu",
+        ];
+
+        let mut loaded_font_count = 0;
+        for font_name in fonts_to_load.iter() {
+            let query = fontdb::Query {
+                families: &[fontdb::Family::Name(font_name)],
+                ..Default::default()
+            };
+
+            if let Some(font_id) = db.query(&query) {
+                if let Some(font_source) = db.face_source(font_id) {
+                    let font_data: Option<std::borrow::Cow<[u8]>> = match font_source.0 {
+                        fontdb::Source::Binary(data) => {
+                            Some(std::borrow::Cow::Owned(data.as_ref().as_ref().to_vec()))
+                        }
+                        fontdb::Source::File(path) => {
+                            std::fs::read(path).ok().map(std::borrow::Cow::Owned)
+                        }
+                        fontdb::Source::SharedFile(path, _) => {
+                            std::fs::read(path).ok().map(std::borrow::Cow::Owned)
+                        }
+                    };
+
+                    if let Some(font_data) = font_data {
+                        let font_name_string = font_name.to_string();
+                        let egui_font_name =
+                            format!("system-{}", font_name_string.to_lowercase().replace(' ', "_"));
+
+                        fonts.font_data.insert(
+                            egui_font_name.clone(),
+                            egui::FontData::from_owned(font_data.to_vec()).into(),
+                        );
+
+                        fonts
+                            .families
+                            .entry(egui::FontFamily::Proportional)
+                            .or_default()
+                            .push(egui_font_name.clone());
+
+                        tracing::info!("Loaded system font: {}", font_name);
+                        loaded_font_count += 1;
+                    }
+                }
+            }
+        }
+
+        if loaded_font_count == 0 {
+            tracing::warn!(
+                "No preferred CJK or fallback fonts found on the system. Default fonts will be used."
+            );
+        }
+
+        // --- END FONT SETUP ---
         cc.egui_ctx.set_fonts(fonts);
 
         Self {
@@ -59,6 +143,7 @@ impl App {
             show_settings_window: false,
             show_toolbar: false,
             show_emote_picker: false,
+            show_user_list: false,
             startup_task_spawned: false,
         }
     }
@@ -71,7 +156,7 @@ impl eframe::App for App {
         self.apply_settings(ctx);
 
         while let Ok(event) = self.event_rx.try_recv() {
-            reducer::reduce(&mut self.state, event, &mut self.config);
+            reducer::reduce(&mut self.state, event, &mut self.config, self.event_tx.clone());
         }
 
         let mut send_action: Option<bool> = None;
@@ -96,7 +181,7 @@ impl eframe::App for App {
                         };
 
                         if let Some(client_id) = config.client_id {
-                            match AuthClient::new(client_id, tx.clone()) {
+                            match AuthClient::new(client_id, tx.clone()).await {
                                 Ok(auth_client) => {
                                     let result = auth_client.try_silent_login().await;
                                     tx.send(AppEvent::SilentLoginComplete(result)).await.ok();
@@ -150,7 +235,7 @@ impl App {
         };
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
-            match AuthClient::new(client_id, tx.clone()) {
+            match AuthClient::new(client_id, tx.clone()).await {
                 Ok(auth_client) => auth_client.interactive_login().await,
                 Err(e) => {
                     let _ = tx
@@ -246,14 +331,13 @@ impl App {
                 if self.show_toolbar {
                     egui::MenuBar::new().ui(ui, |ui| {
                         ui.menu_button("File", |ui| {
-                            if ui.button("Settings").clicked() {
-                                self.show_settings_window = true;
-                                ui.close();
-                            }
                             if ui.button("Exit").clicked() {
                                 std::process::exit(0);
                             }
                         });
+                        if ui.button("Settings").clicked() {
+                            self.show_settings_window = true;
+                        }
                     });
                 }
 
@@ -303,21 +387,29 @@ impl App {
 
             TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
                 if self.show_emote_picker {
-                    emote_picker::draw_emote_picker(ui, &mut self.state);
+                    emote_picker::draw_emote_picker(ui, &mut self.state, &self.config);
                     ui.separator();
                 }
-                chat_bar::draw_chat_bar(ui, &mut self.state, send_action, &mut self.show_emote_picker);
+                chat_bar::draw_chat_bar(
+                    ui,
+                    &mut self.state,
+                    send_action,
+                    &mut self.show_emote_picker,
+                    &mut self.show_user_list,
+                );
             });
 
-            SidePanel::right("user_list_panel")
-                .min_width(150.0)
-                .default_width(180.0)
-                .show(ctx, |ui| {
-                    user_list::draw_user_list(ui, &mut self.state);
-                });
+            if self.show_user_list {
+                SidePanel::right("user_list_panel")
+                    .min_width(150.0)
+                    .default_width(180.0)
+                    .show(ctx, |ui| {
+                        user_list::draw_user_list(ui, &mut self.state);
+                    });
+            }
 
             egui::CentralPanel::default().show(ctx, |ui| {
-                chat_log::draw_chat_log(ui, &mut self.state);
+                chat_log::draw_chat_log(ui, &mut self.state, self.config.emote_size);
             });
 
             self.draw_settings_window(ctx);
@@ -333,6 +425,13 @@ impl App {
 
                 config_changed |= ui
                     .add(egui::Slider::new(&mut self.config.font_size, 8.0..=24.0).text("Font Size"))
+                    .changed();
+
+                config_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut self.config.emote_size, 16.0..=64.0)
+                            .text("Emote Size"),
+                    )
                     .changed();
 
                 if config_changed {

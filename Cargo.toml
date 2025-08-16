@@ -9,7 +9,7 @@ chrono = { version = "0.4.41", features = ["serde"] }
 dirs = "6.0.0"
 eframe = "0.32.0"
 egui = "0.32.0"
-egui_extras = { version = "0.32.0", features = ["image"] }
+egui_extras = { version = "0.32.0", features = ["image", "http"] }
 eyre = "0.6.11"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 fontdb = "0.23.0"
@@ -30,7 +30,7 @@ tokio-tungstenite = { version = "0.27.0", features = ["rustls-tls-webpki-roots"]
 toml = "0.9.5"
 tracing = "0.1.40"
 tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "local-time"] }
 twitch_api = { version = "0.7.2", features = ["helix", "reqwest", "eventsub"] }
 twitch_oauth2 = { version = "0.15.2", features = ["reqwest"] }
 twitch_types = "0.4.8"

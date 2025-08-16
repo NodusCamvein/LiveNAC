@@ -9,6 +9,8 @@ async fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
         .init();
 
     let native_options = NativeOptions::default();

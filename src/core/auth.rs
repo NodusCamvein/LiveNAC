@@ -45,7 +45,7 @@ pub struct AuthClient {
 }
 
 impl AuthClient {
-    pub fn new(
+    pub async fn new(
         client_id: String,
         ui_message_tx: mpsc::Sender<AppEvent>,
     ) -> Result<Self, eyre::Report> {
@@ -68,7 +68,9 @@ impl AuthClient {
             .ok_or_else(|| eyre!("Could not find a config directory"))?
             .join(env!("CARGO_PKG_NAME"));
         if !data_path.exists() {
-            std::fs::create_dir_all(&data_path).context("Failed to create config directory")?;
+            tokio::fs::create_dir_all(&data_path)
+                .await
+                .context("Failed to create config directory")?;
         }
 
         Ok(Self {
