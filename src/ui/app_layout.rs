@@ -12,26 +12,10 @@ use crate::{
     events::app_event::{AppEvent, ChatEvent},
     ui::{chat_bar, chat_log, emote_picker, user_list},
 };
-use eframe::egui::{
-    self, Align, FontDefinitions, FontFamily, Key, Layout, SidePanel, TopBottomPanel,
-};
+use eframe::egui::{self, Align, FontDefinitions, Key, Layout, SidePanel, TopBottomPanel};
 use tokio::sync::mpsc;
 
 use crate::core::auth::AuthMessage;
-use fontdb::Database;
-
-const CJK_FONTS: &[&str] = &[
-    "Noto Sans JP",
-    "Yu Gothic UI",
-    "Meiryo UI",
-    "Hiragino Sans",
-    "PingFang SC",
-    "Microsoft YaHei UI",
-    "Malgun Gothic",
-    "Apple SD Gothic Neo",
-    "WenQuanYi Zen Hei",
-    "Droid Sans Fallback",
-];
 
 pub struct App {
     state: AppState,
@@ -41,18 +25,31 @@ pub struct App {
     show_settings_window: bool,
     show_toolbar: bool,
     show_emote_picker: bool,
-    last_applied_cjk: bool,
     startup_task_spawned: bool,
-    font_db: Database,
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (event_tx, event_rx) = mpsc::channel(100);
         let default_config = Config::default();
 
-        let mut font_db = Database::new();
-        font_db.load_system_fonts();
+        let mut fonts = FontDefinitions::default();
+
+        fonts.font_data.insert(
+            "livenac_font".to_owned(),
+            egui::FontData::from_static(include_bytes!(
+                "../../assets/fonts/NotoSansJP-Regular.otf"
+            ))
+            .into(),
+        );
+
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "livenac_font".to_owned());
+
+        cc.egui_ctx.set_fonts(fonts);
 
         Self {
             state: AppState::Startup,
@@ -62,9 +59,7 @@ impl App {
             show_settings_window: false,
             show_toolbar: false,
             show_emote_picker: false,
-            last_applied_cjk: default_config.enable_cjk_font,
             startup_task_spawned: false,
-            font_db,
         }
     }
 }
@@ -175,30 +170,6 @@ impl App {
             font_id.size = self.config.font_size;
         });
         ctx.set_style(style);
-
-        if self.config.enable_cjk_font != self.last_applied_cjk {
-            let mut fonts = FontDefinitions::default();
-            if self.config.enable_cjk_font {
-                if let Some(proportional) = fonts.families.get_mut(&FontFamily::Proportional) {
-                    for font_name in CJK_FONTS.iter().rev() {
-                        if self
-                            .font_db
-                            .query(&fontdb::Query {
-                                families: &[fontdb::Family::Name(font_name)],
-                                weight: fontdb::Weight::NORMAL,
-                                style: fontdb::Style::Normal,
-                                ..fontdb::Query::default()
-                            })
-                            .is_some()
-                        {
-                            proportional.insert(0, font_name.to_string());
-                        }
-                    }
-                }
-            }
-            ctx.set_fonts(fonts);
-            self.last_applied_cjk = self.config.enable_cjk_font;
-        }
     }
 
     fn draw_loading_ui(&self, ctx: &egui::Context, message: &str) {
@@ -359,13 +330,6 @@ impl App {
             .show(ctx, |ui| {
                 ui.heading("Appearance");
                 let mut config_changed = false;
-                config_changed |= ui
-                    .checkbox(&mut self.config.enable_cjk_font, "Enable CJK Font Support")
-                    .changed();
-                if self.config.enable_cjk_font {
-                    ui.label("Note: Requires a font with Japanese character support to be installed (e.g., 'Noto Sans JP', 'Yu Gothic UI').");
-                    ui.hyperlink_to("Download Noto Sans JP from Google Fonts", "https://fonts.google.com/specimen/Noto+Sans+JP");
-                }
 
                 config_changed |= ui
                     .add(egui::Slider::new(&mut self.config.font_size, 8.0..=24.0).text("Font Size"))
