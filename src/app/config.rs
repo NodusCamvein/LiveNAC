@@ -7,12 +7,21 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Profile {
+    pub name: String,
+    pub twitch_user_id: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     pub client_id: Option<String>,
     pub enable_cjk_font: bool,
     pub font_size: f32,
     pub emote_size: f32,
+    pub collapse_emotes: bool,
+    pub profiles: Vec<Profile>,
+    pub active_profile_name: Option<String>,
 }
 
 impl Default for Config {
@@ -22,6 +31,18 @@ impl Default for Config {
             enable_cjk_font: false,
             font_size: 14.0,
             emote_size: 14.0,
+            collapse_emotes: false,
+            profiles: Vec::new(),
+            active_profile_name: None,
+        }
+    }
+}
+
+impl Config {
+    pub fn get_active_profile(&self) -> Option<&Profile> {
+        match &self.active_profile_name {
+            Some(name) => self.profiles.iter().find(|p| &p.name == name),
+            None => None,
         }
     }
 }

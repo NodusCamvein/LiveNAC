@@ -13,6 +13,7 @@ pub enum AppState {
     Startup,
     FirstTimeSetup {
         client_id_input: String,
+        profile_name_input: String,
         error: Option<String>,
     },
     Authenticating {
