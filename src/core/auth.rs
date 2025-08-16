@@ -1,36 +1,37 @@
 use crate::events::app_event::AppEvent;
 use dirs;
-use eyre::{Context, eyre};
+use eyre::{eyre, Context};
+use http_body_util::{BodyExt, Full};
+use hyper::{body::Bytes, service::service_fn, Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use reqwest::Client as ReqwestClient;
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, time::Duration};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
-use twitch_oauth2::{DeviceUserTokenBuilder, UserToken};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+};
+use twitch_oauth2::{AccessToken, RefreshToken, UserToken};
+use url::Url;
 
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const TOKEN_FILE_NAME: &str = "token.json";
+const REDIRECT_URI: &str = "http://localhost:3000";
+
+const HTML_LANDING_PAGE: &str = include_str!("success.html");
 
 #[derive(Debug)]
 pub enum AuthMessage {
-    /// A message from the auth task to the UI thread.
-    /// Prompt the user to authorize with the given URI and code.
-    AwaitingDeviceActivation {
-        uri: String,
-        user_code: String,
-    },
     Success(UserToken),
     Error(String),
 }
 
-/// A simplified token structure for serialization.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize)]
 struct StoredToken {
-    access_token: twitch_oauth2::AccessToken,
-    refresh_token: twitch_oauth2::RefreshToken,
+    access_token: String,
 }
 
-/// The client responsible for handling authentication.
 #[derive(Clone)]
 pub struct AuthClient {
     reqwest_client: ReqwestClient,
@@ -76,25 +77,20 @@ impl AuthClient {
         })
     }
 
-    /// The main entry point for authentication.
-    pub async fn get_or_refresh_token(self) {
+    pub async fn authenticate(self) {
         tracing::info!("Starting token acquisition process...");
-        let result = self.load_and_validate_token().await;
-        tracing::info!("Token validation finished. Result: {:?}", result.is_ok());
-
-        match result {
+        match self.load_and_validate_token().await {
             Ok(token) => {
                 tracing::info!("Successfully loaded and validated a token.");
-                let _ = self.save_token_to_disk(&token).await;
                 self.send_message(AuthMessage::Success(token)).await;
             }
             Err(e) => {
                 tracing::warn!(
-                    "Could not load a valid token ({}). Starting device flow.",
+                    "Could not load a valid token ({}). Starting browser flow.",
                     e
                 );
-                if let Err(e) = self.run_device_flow().await {
-                    tracing::error!("Device flow failed: {}", e);
+                if let Err(e) = self.run_browser_flow().await {
+                    tracing::error!("Browser flow failed: {}", e);
                     self.send_message(AuthMessage::Error(format!("Authentication failed: {}", e)))
                         .await;
                 }
@@ -102,63 +98,84 @@ impl AuthClient {
         }
     }
 
-    /// Tries to load a token from disk and validate it. Refreshes if expired.
     async fn load_and_validate_token(&self) -> Result<UserToken, eyre::Report> {
         tracing::info!("Attempting to load token from disk...");
         let stored = self.load_token_from_disk().await?;
+        let access_token = AccessToken::new(stored.access_token);
 
-        let token = UserToken::from_existing_or_refresh_token(
-            &self.reqwest_client,
-            stored.access_token,
-            stored.refresh_token,
-            self.client_id.clone(),
-            None,
-        )
-        .await
-        .context("Failed to validate or refresh token")?;
+        let validated = access_token
+            .validate_token(&self.reqwest_client)
+            .await
+            .context("Failed to validate token")?;
+
+        let token = UserToken::new(access_token, None::<RefreshToken>, validated, None)?;
 
         tracing::info!("Token is valid.");
         Ok(token)
     }
 
-    /// Executes the full Device Code Flow.
-    async fn run_device_flow(&self) -> Result<(), eyre::Report> {
-        tracing::info!("Starting new device flow...");
-        let mut builder = DeviceUserTokenBuilder::new(self.client_id.clone(), self.scopes.clone());
+    async fn run_browser_flow(&self) -> Result<(), eyre::Report> {
+        let (token_tx, token_rx) = oneshot::channel();
 
-        let code = builder
-            .start(&self.reqwest_client)
-            .await
-            .context("Failed to start device flow")?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+        let listener = TcpListener::bind(addr).await?;
+        let server_handle = tokio::spawn(run_server(listener, token_tx));
 
-        self.send_message(AuthMessage::AwaitingDeviceActivation {
-            uri: code.verification_uri.clone(),
-            user_code: code.user_code.clone(),
-        })
-        .await;
+        let scope_str = self
+            .scopes
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
 
-        let token = builder
-            .wait_for_code(&self.reqwest_client, tokio::time::sleep)
-            .await
-            .context("Failed to get token from device flow")?;
-        tracing::info!("Successfully received token from device flow.");
+        let auth_url = Url::parse_with_params(
+            "https://id.twitch.tv/oauth2/authorize",
+            &[
+                ("response_type", "token"),
+                ("client_id", self.client_id.as_str()),
+                ("redirect_uri", REDIRECT_URI),
+                ("scope", &scope_str),
+            ],
+        )?;
 
-        self.save_token_to_disk(&token).await?;
+        if webbrowser::open(auth_url.as_str()).is_err() {
+            tracing::error!(
+                "Failed to open browser. Please navigate to this URL manually: {}",
+                auth_url
+            );
+        }
 
-        self.send_message(AuthMessage::Success(token)).await;
-
-        Ok(())
+        tokio::select! {
+            token_result = token_rx => {
+                server_handle.abort();
+                match token_result {
+                    Ok(token) => {
+                        let validated = token.validate_token(&self.reqwest_client).await?;
+                        let full_token = UserToken::new(token.clone(), None::<RefreshToken>, validated, None)?;
+                        self.save_token_to_disk(&token).await?;
+                        self.send_message(AuthMessage::Success(full_token)).await;
+                        Ok(())
+                    }
+                    Err(_) => {
+                        let err_msg = "The authentication server was closed before a token was received.".to_string();
+                        self.send_message(AuthMessage::Error(err_msg.clone())).await;
+                        Err(eyre!(err_msg))
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(180)) => {
+                server_handle.abort();
+                let err_msg = "Login timed out after 3 minutes.".to_string();
+                self.send_message(AuthMessage::Error(err_msg.clone())).await;
+                Err(eyre!(err_msg))
+            }
+        }
     }
 
-    /// Saves the UserToken to a file on disk asynchronously.
-    async fn save_token_to_disk(&self, token: &UserToken) -> Result<(), eyre::Report> {
+    async fn save_token_to_disk(&self, token: &AccessToken) -> Result<(), eyre::Report> {
         let path = self.data_path.join(TOKEN_FILE_NAME);
         let stored_token = StoredToken {
-            access_token: token.access_token.clone(),
-            refresh_token: token
-                .refresh_token
-                .clone()
-                .ok_or_else(|| eyre!("Cannot save a token without a refresh token"))?,
+            access_token: token.secret().to_string(),
         };
         let bytes = serde_json::to_vec_pretty(&stored_token)?;
         if let Some(parent) = path.parent() {
@@ -171,20 +188,79 @@ impl AuthClient {
         Ok(())
     }
 
-    /// Loads a UserToken from a file on disk asynchronously.
     async fn load_token_from_disk(&self) -> Result<StoredToken, eyre::Report> {
         let path = self.data_path.join(TOKEN_FILE_NAME);
         let mut file = tokio::fs::File::open(path).await?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer).await?;
-        let token: StoredToken = serde_json::from_slice(&buffer)?;
+        let token: StoredToken =
+            serde_json::from_slice(&buffer).context("Failed to deserialize token")?;
         Ok(token)
     }
 
-    /// Helper to send a message to the UI thread.
     async fn send_message(&self, msg: AuthMessage) {
         if self.ui_message_tx.send(AppEvent::Auth(msg)).await.is_err() {
             tracing::error!("Failed to send message to UI thread: channel is closed.");
+        }
+    }
+}
+
+async fn run_server(listener: TcpListener, token_tx: oneshot::Sender<AccessToken>) {
+    let token_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(token_tx)));
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => return, // Listener was closed
+        };
+        let io = TokioIo::new(stream);
+        let token_tx_clone = token_tx.clone();
+
+        tokio::task::spawn(async move {
+            let service = service_fn(move |req| handle_request(req, token_tx_clone.clone()));
+            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await
+            {
+                tracing::debug!("Server connection error: {}", err);
+            }
+        });
+    }
+}
+
+async fn handle_request(
+    req: Request<hyper::body::Incoming>,
+    token_tx: std::sync::Arc<tokio::sync::Mutex<Option<oneshot::Sender<AccessToken>>>>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    match (req.method(), req.uri().path()) {
+        (&Method::GET, "/") => Ok(Response::new(Full::new(Bytes::from(HTML_LANDING_PAGE)))),
+        (&Method::POST, "/token") => {
+            let whole_body = req.into_body().collect().await?.to_bytes();
+            let token_data: serde_json::Value = match serde_json::from_slice(&whole_body) {
+                Ok(data) => data,
+                Err(_) => {
+                    let mut response = Response::new(Full::new(Bytes::from("Bad Request")));
+                    *response.status_mut() = StatusCode::BAD_REQUEST;
+                    return Ok(response);
+                }
+            };
+
+            let access_token_str = token_data["access_token"].as_str().unwrap_or_default();
+            let access_token = twitch_oauth2::AccessToken::new(access_token_str.to_string());
+
+            if let Some(tx) = token_tx.lock().await.take() {
+                if tx.send(access_token).is_ok() {
+                    return Ok(Response::new(Full::new(Bytes::from("OK"))));
+                }
+            }
+
+            let mut response = Response::new(Full::new(Bytes::from("Internal Server Error")));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            Ok(response)
+        }
+        _ => {
+            let mut not_found = Response::new(Full::new(Bytes::from("Not Found")));
+            *not_found.status_mut() = StatusCode::NOT_FOUND;
+            Ok(not_found)
         }
     }
 }

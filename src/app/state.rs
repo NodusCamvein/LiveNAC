@@ -7,13 +7,6 @@ use tokio::task::JoinHandle;
 use twitch_oauth2::UserToken;
 use twitch_types::UserId;
 
-/// Holds the URI and code for the device flow.
-#[derive(Clone, Debug, Default)]
-pub struct DeviceFlowInfo {
-    pub uri: String,
-    pub user_code: String,
-}
-
 /// Represents the various states of the application's lifecycle.
 pub enum AppState {
     LoadingConfig,
@@ -23,7 +16,6 @@ pub enum AppState {
     },
     Authenticating {
         status_message: String,
-        device_flow_info: Option<DeviceFlowInfo>,
     },
     LoggedIn {
         token: Arc<UserToken>,

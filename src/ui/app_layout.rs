@@ -61,7 +61,7 @@ impl eframe::App for App {
         }
 
         let mut send_action: Option<bool> = None;
-        let mut login_action: Option<String> = None;
+        let mut login_action: Option<bool> = None;
 
         match &mut self.state {
             AppState::LoadingConfig => self.draw_loading_ui(ctx),
@@ -73,8 +73,8 @@ impl eframe::App for App {
         if let Some(is_announcement) = send_action {
             self.send_message(is_announcement);
         }
-        if let Some(client_id) = login_action {
-            self.handle_login_action(client_id);
+        if let Some(true) = login_action {
+            self.handle_login_action();
         }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -82,26 +82,25 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn handle_login_action(&mut self, client_id: String) {
-        self.config.client_id = Some(client_id.clone());
-        let config_to_save = self.config.clone();
-        tokio::spawn(async move {
-            if let Err(e) = config::save(&config_to_save).await {
-                tracing::error!("Failed to save config: {}", e);
+    fn handle_login_action(&mut self) {
+        if let Some(client_id) = self.config.client_id.clone() {
+            self.start_authentication(client_id);
+        } else {
+            tracing::error!("Client ID not found in config!");
+            if let AppState::FirstTimeSetup { error, .. } = &mut self.state {
+                *error = Some("Client ID not found in configuration. Please check your config file.".to_string());
             }
-        });
-        self.start_authentication(client_id);
+        }
     }
 
     fn start_authentication(&mut self, client_id: String) {
         self.state = AppState::Authenticating {
             status_message: "Logging in...".to_string(),
-            device_flow_info: None,
         };
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             match AuthClient::new(client_id, tx.clone()) {
-                Ok(auth_client) => auth_client.get_or_refresh_token().await,
+                Ok(auth_client) => auth_client.authenticate().await,
                 Err(e) => {
                     let _ = tx
                         .send(AppEvent::Auth(crate::core::auth::AuthMessage::Error(
@@ -143,12 +142,8 @@ impl App {
         });
     }
 
-    fn draw_first_time_setup(&mut self, ctx: &egui::Context, login_action: &mut Option<String>) {
-        if let AppState::FirstTimeSetup {
-            client_id_input,
-            error,
-        } = &mut self.state
-        {
+    fn draw_first_time_setup(&mut self, ctx: &egui::Context, login_action: &mut Option<bool>) {
+        if let AppState::FirstTimeSetup { error, .. } = &mut self.state {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.with_layout(Layout::top_down(Align::Center), |ui| {
                     ui.add_space(ui.available_height() * 0.2);
@@ -157,13 +152,9 @@ impl App {
                 });
                 ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
                     ui.add_space(ui.available_height() * 0.4);
-                    if ui.button("Login").clicked() && !client_id_input.is_empty() {
-                        *login_action = Some(client_id_input.clone());
+                    if ui.button("Login with Twitch").clicked() {
+                        *login_action = Some(true);
                     }
-                    ui.add(
-                        egui::TextEdit::singleline(client_id_input)
-                            .hint_text("Enter your Twitch Client ID here"),
-                    );
                     if let Some(err) = error {
                         ui.colored_label(egui::Color32::RED, err);
                     }
@@ -173,26 +164,17 @@ impl App {
     }
 
     fn draw_authenticating_ui(&self, ctx: &egui::Context) {
-        if let AppState::Authenticating {
-            device_flow_info, ..
-        } = &self.state
-        {
+        if let AppState::Authenticating { status_message, .. } = &self.state {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.centered_and_justified(|ui| {
-                    if let Some(info) = device_flow_info {
-                        ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                            ui.heading("Login to Twitch");
-                            ui.label("Please go to the following URL in your browser:");
-                            ui.hyperlink(&info.uri);
-                            ui.add_space(10.0);
-                            ui.label("And enter this code:");
-                            ui.heading(&info.user_code);
-                            ui.add_space(10.0);
-                            ui.spinner();
-                        });
-                    } else {
+                    ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                        ui.heading("Authenticating...");
+                        ui.label(status_message);
+                        ui.add_space(10.0);
+                        ui.label("Please check your web browser to continue.");
+                        ui.add_space(10.0);
                         ui.spinner();
-                    }
+                    });
                 });
             });
         }

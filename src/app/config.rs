@@ -33,13 +33,23 @@ fn get_config_path() -> Result<PathBuf, eyre::Report> {
 }
 
 pub async fn load() -> Result<Config, eyre::Report> {
-    let path = get_config_path()?;
-    tracing::info!("Loading config from {:?}", path);
+    let user_config_path = get_config_path()?;
+    tracing::info!("Loading user config from {:?}", user_config_path);
+
+    let base_config_path = "config/app_config.toml";
+    tracing::info!("Loading base config from {:?}", base_config_path);
 
     let config: Config = Figment::new()
-        .merge(Toml::file(path))
+        .merge(Toml::file(base_config_path))
+        .merge(Toml::file(&user_config_path))
         .extract()
         .context("Could not load config")?;
+
+    if !user_config_path.exists() {
+        if let Err(e) = save(&config).await {
+            tracing::warn!("Failed to save initial config: {}", e);
+        }
+    }
 
     Ok(config)
 }

@@ -13,6 +13,9 @@ egui_extras = { version = "0.32.0", features = ["image"] }
 eyre = "0.6.11"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 futures = "0.3.30"
+hyper = { version = "1.4.0", features = ["http1", "server"] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1.16", features = ["tokio", "http1"] }
 parking_lot = "0.12.1"
 reqwest = { version = "0.12.23", features = ["json", "rustls-tls"] }
 serde = { version = "1.0.197", features = ["derive"] }
@@ -27,3 +30,4 @@ twitch_api = { version = "0.7.2", features = ["helix", "reqwest", "eventsub"] }
 twitch_oauth2 = { version = "0.15.2", features = ["reqwest"] }
 twitch_types = "0.4.8"
 url = "2.5.0"
+webbrowser = "0.8.12"

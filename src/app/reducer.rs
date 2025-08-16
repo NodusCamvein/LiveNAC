@@ -1,4 +1,4 @@
-use super::state::{AppState, DeviceFlowInfo};
+use super::state::AppState;
 use crate::{
     app::config::Config,
     core::{auth::AuthMessage, chat::ChatClient},
@@ -32,7 +32,6 @@ fn handle_config_loaded(state: &mut AppState, result: Result<Config, eyre::Repor
                 // self.start_authentication(id);
                 *state = AppState::Authenticating {
                     status_message: "Authenticating...".to_string(),
-                    device_flow_info: None,
                 };
             } else {
                 *state = AppState::FirstTimeSetup {
@@ -51,16 +50,8 @@ fn handle_config_loaded(state: &mut AppState, result: Result<Config, eyre::Repor
 }
 
 fn handle_auth_message(state: &mut AppState, msg: AuthMessage) {
-    if let AppState::Authenticating {
-        status_message,
-        device_flow_info,
-    } = state
-    {
+    if let AppState::Authenticating { .. } = state {
         match msg {
-            AuthMessage::AwaitingDeviceActivation { uri, user_code } => {
-                *status_message = "Please authorize in your browser.".to_string();
-                *device_flow_info = Some(DeviceFlowInfo { uri, user_code });
-            }
             AuthMessage::Success(token) => {
                 let user_id = token.user_id.clone();
                 let user_login = token.login.to_string();

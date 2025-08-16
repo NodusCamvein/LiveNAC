@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>LiveNAC Authentication</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            background-color: #1a1a1a;
+            color: #e0e0e0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            text-align: center;
+        }
+    </style>
+    <script>
+        async function handleLogin() {
+            const hash = window.location.hash.substring(1);
+            const params = new URLSearchParams(hash);
+            const accessToken = params.get("access_token");
+            const scope = params.get("scope");
+
+            if (accessToken) {
+                try {
+                    const response = await fetch("http://localhost:3000/token", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ access_token: accessToken, scope: scope }),
+                    });
+                    if (response.ok) {
+                        document.getElementById("message").innerText = "Success! You can now close this window.";
+                        setTimeout(() => window.close(), 1000);
+                    } else {
+                        const errorText = await response.text();
+                        document.getElementById("message").innerText = "An error occurred: " + errorText;
+                    }
+                } catch (e) {
+                    document.getElementById("message").innerText = "Failed to communicate with the application. Please ensure it's still running.";
+                }
+            } else {
+                document.getElementById("message").innerText = "Could not find access token in URL. Please try logging in again.";
+            }
+        }
+        window.onload = handleLogin;
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1 id="message">Authenticating, please wait...</h1>
+    </div>
+</body>
+</html>
