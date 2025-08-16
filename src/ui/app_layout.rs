@@ -17,6 +17,22 @@ use eframe::egui::{
 };
 use tokio::sync::mpsc;
 
+use crate::core::auth::AuthMessage;
+use fontdb::Database;
+
+const CJK_FONTS: &[&str] = &[
+    "Noto Sans JP",
+    "Yu Gothic UI",
+    "Meiryo UI",
+    "Hiragino Sans",
+    "PingFang SC",
+    "Microsoft YaHei UI",
+    "Malgun Gothic",
+    "Apple SD Gothic Neo",
+    "WenQuanYi Zen Hei",
+    "Droid Sans Fallback",
+];
+
 pub struct App {
     state: AppState,
     event_rx: mpsc::Receiver<AppEvent>,
@@ -25,46 +41,86 @@ pub struct App {
     show_settings_window: bool,
     show_toolbar: bool,
     show_emote_picker: bool,
-    last_applied_font_size: f32,
+    last_applied_cjk: bool,
+    startup_task_spawned: bool,
+    font_db: Database,
 }
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (event_tx, event_rx) = mpsc::channel(100);
-        let tx = event_tx.clone();
-        tokio::spawn(async move {
-            let config_result = config::load().await;
-            let _ = tx.send(AppEvent::ConfigLoaded(config_result)).await;
-        });
-
         let default_config = Config::default();
 
+        let mut font_db = Database::new();
+        font_db.load_system_fonts();
+
         Self {
-            state: AppState::LoadingConfig,
+            state: AppState::Startup,
             event_rx,
             event_tx,
             config: default_config.clone(),
             show_settings_window: false,
             show_toolbar: false,
             show_emote_picker: false,
-            last_applied_font_size: default_config.font_size,
+            last_applied_cjk: default_config.enable_cjk_font,
+            startup_task_spawned: false,
+            font_db,
         }
     }
 }
+
+use eyre::eyre;
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_settings(ctx);
 
         while let Ok(event) = self.event_rx.try_recv() {
-            reducer::reduce(&mut self.state, event);
+            reducer::reduce(&mut self.state, event, &mut self.config);
         }
 
         let mut send_action: Option<bool> = None;
         let mut login_action: Option<bool> = None;
 
         match &mut self.state {
-            AppState::LoadingConfig => self.draw_loading_ui(ctx),
+            AppState::Startup => {
+                if !self.startup_task_spawned {
+                    self.startup_task_spawned = true;
+                    let tx = self.event_tx.clone();
+                    tokio::spawn(async move {
+                        let config_result = config::load().await;
+                        let config = match config_result {
+                            Ok(c) => {
+                                tx.send(AppEvent::ConfigLoaded(Ok(c.clone()))).await.ok();
+                                c
+                            }
+                            Err(e) => {
+                                tx.send(AppEvent::ConfigLoaded(Err(e))).await.ok();
+                                return;
+                            }
+                        };
+
+                        if let Some(client_id) = config.client_id {
+                            match AuthClient::new(client_id, tx.clone()) {
+                                Ok(auth_client) => {
+                                    let result = auth_client.try_silent_login().await;
+                                    tx.send(AppEvent::SilentLoginComplete(result)).await.ok();
+                                }
+                                Err(e) => {
+                                    tx.send(AppEvent::SilentLoginComplete(Err(e))).await.ok();
+                                }
+                            }
+                        } else {
+                            tx.send(AppEvent::SilentLoginComplete(Err(eyre!(
+                                "Client ID not configured"
+                            ))))
+                            .await
+                            .ok();
+                        }
+                    });
+                }
+                self.draw_loading_ui(ctx, "Starting...");
+            }
             AppState::FirstTimeSetup { .. } => self.draw_first_time_setup(ctx, &mut login_action),
             AppState::Authenticating { .. } => self.draw_authenticating_ui(ctx),
             AppState::LoggedIn { .. } => self.draw_logged_in(ctx, &mut send_action),
@@ -100,12 +156,13 @@ impl App {
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             match AuthClient::new(client_id, tx.clone()) {
-                Ok(auth_client) => auth_client.authenticate().await,
+                Ok(auth_client) => auth_client.interactive_login().await,
                 Err(e) => {
                     let _ = tx
-                        .send(AppEvent::Auth(crate::core::auth::AuthMessage::Error(
-                            format!("Initialization failed: {}", e),
-                        )))
+                        .send(AppEvent::Auth(AuthMessage::Error(format!(
+                            "Initialization failed: {}",
+                            e
+                        ))))
                         .await;
                 }
             }
@@ -114,31 +171,45 @@ impl App {
 
     fn apply_settings(&mut self, ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
-        let mut fonts = FontDefinitions::default();
-
-        if self.config.enable_cjk_font {
-            fonts
-                .families
-                .entry(FontFamily::Proportional)
-                .or_default()
-                .insert(0, "Noto Sans CJK JP".to_owned());
-        }
-
         style.text_styles.iter_mut().for_each(|(_, font_id)| {
             font_id.size = self.config.font_size;
         });
-
         ctx.set_style(style);
 
-        if self.last_applied_font_size != self.config.font_size {
+        if self.config.enable_cjk_font != self.last_applied_cjk {
+            let mut fonts = FontDefinitions::default();
+            if self.config.enable_cjk_font {
+                if let Some(proportional) = fonts.families.get_mut(&FontFamily::Proportional) {
+                    for font_name in CJK_FONTS.iter().rev() {
+                        if self
+                            .font_db
+                            .query(&fontdb::Query {
+                                families: &[fontdb::Family::Name(font_name)],
+                                weight: fontdb::Weight::NORMAL,
+                                style: fontdb::Style::Normal,
+                                ..fontdb::Query::default()
+                            })
+                            .is_some()
+                        {
+                            proportional.insert(0, font_name.to_string());
+                        }
+                    }
+                }
+            }
             ctx.set_fonts(fonts);
-            self.last_applied_font_size = self.config.font_size;
+            self.last_applied_cjk = self.config.enable_cjk_font;
         }
     }
 
-    fn draw_loading_ui(&self, ctx: &egui::Context) {
+    fn draw_loading_ui(&self, ctx: &egui::Context, message: &str) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.centered_and_justified(|ui| ui.spinner());
+            ui.centered_and_justified(|ui| {
+                ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                    ui.heading(message);
+                    ui.add_space(10.0);
+                    ui.spinner();
+                });
+            });
         });
     }
 
@@ -292,8 +363,8 @@ impl App {
                     .checkbox(&mut self.config.enable_cjk_font, "Enable CJK Font Support")
                     .changed();
                 if self.config.enable_cjk_font {
-                    ui.label("Note: Requires a font like 'Noto Sans CJK JP' to be installed on your system.");
-                    ui.hyperlink_to("Download Noto Sans CJK from Google Fonts", "https://fonts.google.com/noto/specimen/Noto+Sans+JP");
+                    ui.label("Note: Requires a font with Japanese character support to be installed (e.g., 'Noto Sans JP', 'Yu Gothic UI').");
+                    ui.hyperlink_to("Download Noto Sans JP from Google Fonts", "https://fonts.google.com/specimen/Noto+Sans+JP");
                 }
 
                 config_changed |= ui

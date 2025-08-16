@@ -4,20 +4,23 @@ use eyre::{eyre, Context};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Bytes, service::service_fn, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use rcgen::generate_simple_self_signed;
 use reqwest::Client as ReqwestClient;
+use rustls_pemfile::{certs, pkcs8_private_keys};
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{io::Cursor, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::{mpsc, oneshot},
 };
+use tokio_rustls::TlsAcceptor;
 use twitch_oauth2::{AccessToken, RefreshToken, UserToken};
 use url::Url;
 
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const TOKEN_FILE_NAME: &str = "token.json";
-const REDIRECT_URI: &str = "http://localhost:3000";
+const REDIRECT_URI: &str = "https://localhost:3000";
 
 const HTML_LANDING_PAGE: &str = include_str!("success.html");
 
@@ -77,24 +80,16 @@ impl AuthClient {
         })
     }
 
-    pub async fn authenticate(self) {
-        tracing::info!("Starting token acquisition process...");
-        match self.load_and_validate_token().await {
-            Ok(token) => {
-                tracing::info!("Successfully loaded and validated a token.");
-                self.send_message(AuthMessage::Success(token)).await;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Could not load a valid token ({}). Starting browser flow.",
-                    e
-                );
-                if let Err(e) = self.run_browser_flow().await {
-                    tracing::error!("Browser flow failed: {}", e);
-                    self.send_message(AuthMessage::Error(format!("Authentication failed: {}", e)))
-                        .await;
-                }
-            }
+    pub async fn try_silent_login(&self) -> Result<UserToken, eyre::Report> {
+        self.load_and_validate_token().await
+    }
+
+    pub async fn interactive_login(self) {
+        tracing::info!("Starting interactive login flow...");
+        if let Err(e) = self.run_browser_flow().await {
+            tracing::error!("Browser flow failed: {}", e);
+            self.send_message(AuthMessage::Error(format!("Authentication failed: {}", e)))
+                .await;
         }
     }
 
@@ -119,7 +114,32 @@ impl AuthClient {
 
         let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
         let listener = TcpListener::bind(addr).await?;
-        let server_handle = tokio::spawn(run_server(listener, token_tx));
+
+        let cert = generate_simple_self_signed(vec!["localhost".into()])?;
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.signing_key.serialize_pem();
+
+        let mut cert_cursor = Cursor::new(cert_pem.as_bytes());
+        let mut key_cursor = Cursor::new(key_pem.as_bytes());
+
+        let cert_chain = certs(&mut cert_cursor)?
+            .into_iter()
+            .map(rustls::Certificate)
+            .collect();
+        let key_der = pkcs8_private_keys(&mut key_cursor)?
+            .into_iter()
+            .map(rustls::PrivateKey)
+            .next()
+            .ok_or_else(|| eyre!("No private key found in PEM"))?;
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key_der)?;
+
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let server_handle = tokio::spawn(run_server(listener, token_tx, acceptor));
 
         let scope_str = self
             .scopes
@@ -205,17 +225,31 @@ impl AuthClient {
     }
 }
 
-async fn run_server(listener: TcpListener, token_tx: oneshot::Sender<AccessToken>) {
-    let token_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(token_tx)));
+async fn run_server(
+    listener: TcpListener,
+    token_tx: oneshot::Sender<AccessToken>,
+    acceptor: TlsAcceptor,
+) {
+    let token_tx = Arc::new(tokio::sync::Mutex::new(Some(token_tx)));
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(s) => s,
             Err(_) => return, // Listener was closed
         };
-        let io = TokioIo::new(stream);
+
+        let acceptor = acceptor.clone();
         let token_tx_clone = token_tx.clone();
 
         tokio::task::spawn(async move {
+            let stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("TLS accept error: {}", e);
+                    return;
+                }
+            };
+
+            let io = TokioIo::new(stream);
             let service = service_fn(move |req| handle_request(req, token_tx_clone.clone()));
             if let Err(err) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
@@ -229,7 +263,7 @@ async fn run_server(listener: TcpListener, token_tx: oneshot::Sender<AccessToken
 
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
-    token_tx: std::sync::Arc<tokio::sync::Mutex<Option<oneshot::Sender<AccessToken>>>>,
+    token_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<AccessToken>>>>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/") => Ok(Response::new(Full::new(Bytes::from(HTML_LANDING_PAGE)))),

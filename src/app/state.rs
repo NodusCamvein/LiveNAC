@@ -9,7 +9,7 @@ use twitch_types::UserId;
 
 /// Represents the various states of the application's lifecycle.
 pub enum AppState {
-    LoadingConfig,
+    Startup,
     FirstTimeSetup {
         client_id_input: String,
         error: Option<String>,
