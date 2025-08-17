@@ -17,14 +17,8 @@ pub fn draw_chat_log(ui: &mut egui::Ui, state: &mut AppState, config: &Config) {
                         ui.set_min_height(config.emote_size);
 
                         if config.show_timestamps {
-                            let timestamp_str = message.timestamp.format("[%H:%M:%S]").to_string();
+                            let timestamp_str = message.timestamp.format("[%H:%M:%S] ").to_string();
                             ui.label(RichText::new(timestamp_str).color(Color32::from_gray(128)));
-                        }
-
-                        if config.collapse_emotes {
-                            // This is a bit of a hack, but it's the easiest way to
-                            // remove the space between emotes.
-                            ui.spacing_mut().item_spacing.x = 0.0;
                         }
 
                         let color = if let Some((r, g, b)) = message.sender_color {
@@ -34,10 +28,29 @@ pub fn draw_chat_log(ui: &mut egui::Ui, state: &mut AppState, config: &Config) {
                             Color32::from_gray(160)
                         };
                         let sender =
-                            RichText::new(format!("{}:", message.sender_name)).color(color);
+                            RichText::new(format!("{}: ", message.sender_name)).color(color);
                         ui.label(sender);
 
-                        for fragment in &message.fragments {
+                        let original_spacing_x = ui.spacing().item_spacing.x;
+                        for (i, fragment) in message.fragments.iter().enumerate() {
+                            let is_emote = matches!(fragment, MessageFragment::Emote(_));
+                            let mut reset_spacing = true;
+
+                            if i > 0 && config.collapse_emotes {
+                                let prev_is_emote = matches!(
+                                    message.fragments.get(i - 1),
+                                    Some(MessageFragment::Emote(_))
+                                );
+                                if prev_is_emote && is_emote {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    reset_spacing = false;
+                                }
+                            }
+
+                            if reset_spacing {
+                                ui.spacing_mut().item_spacing.x = original_spacing_x;
+                            }
+
                             match fragment {
                                 MessageFragment::Text(text) => {
                                     for segment in parse_text_for_urls(text) {
@@ -65,6 +78,8 @@ pub fn draw_chat_log(ui: &mut egui::Ui, state: &mut AppState, config: &Config) {
                                 }
                             }
                         }
+                        // Restore the original spacing for the next message
+                        ui.spacing_mut().item_spacing.x = original_spacing_x;
                     });
                 }
             });

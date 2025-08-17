@@ -8,7 +8,7 @@ pub enum ProfileManagerAction {
     Remove(String),
 }
 
-pub fn draw_profile_manager(
+pub fn draw_profiles_ui(
     ctx: &egui::Context,
     ui: &mut Ui,
     config: &Config, // No longer mutable, actions will be handled in app_layout

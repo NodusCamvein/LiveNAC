@@ -2,14 +2,14 @@ use super::state::AppState;
 use crate::{
     app::config::Config,
     core::{
-        auth::{AuthClient, AuthMessage},
+        auth::AuthMessage,
         chat::ChatClient,
     },
     emotes::twitch_api::TwitchApiClient,
     events::app_event::{AppEvent, ChatEvent},
     models::{message::MessageFragment, user::User},
 };
-use std::{collections::HashSet, mem, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 use tokio::sync::mpsc;
 use twitch_oauth2::UserToken;
 
@@ -26,25 +26,33 @@ pub fn reduce(
         AppEvent::SilentLoginComplete(result) => {
             handle_silent_login_complete(state, result, config, event_tx.clone());
         }
+        AppEvent::ProfileSwitchSilentLoginComplete(result, profile_name) => {
+            match result {
+                Ok(token) => handle_successful_login(state, token, config, event_tx, Some(profile_name)),
+                Err(e) => {
+                    tracing::warn!(
+                        "Silent login for profile '{}' failed: {}. Proceeding to interactive flow.",
+                        profile_name,
+                        e
+                    );
+                    *state = AppState::RequestingInteractiveLogin { profile_name };
+                }
+            }
+        }
         AppEvent::Auth(auth_message) => {
             handle_auth_message(state, auth_message, config, event_tx.clone());
         }
         AppEvent::AuthCancel => {
-            if let AppState::WaitingForToken { .. } = state {
-                tracing::info!("Authentication cancelled by user.");
-                *state = AppState::Startup {
-                    task_spawned: false,
-                };
-            }
-        }
-        AppEvent::TokenPasted(token) => {
-            handle_token_pasted(state, token, config, event_tx.clone());
+            // This is now only used if the user closes the window during first time setup
+            // or other non-post-login flows.
+            // The interactive login flow can't be cancelled from the app side anymore.
         }
         AppEvent::AuthFlowStartFailed(err) => {
             // If the auth flow fails to even start, the best we can do is go back
             // to the setup screen and display an error.
             *state = AppState::FirstTimeSetup {
                 client_id_input: config.client_id.clone().unwrap_or_default(),
+                client_secret_input: String::new(),
                 profile_name_input: String::new(),
                 error: Some(err),
             };
@@ -85,43 +93,20 @@ fn handle_silent_login_complete(
             handle_successful_login(state, token, config, event_tx, None);
         }
         Err(e) => {
-            tracing::info!("Silent login failed: {}. Proceeding to first time setup.", e);
-            *state = AppState::FirstTimeSetup {
-                client_id_input: String::new(),
-                profile_name_input: String::new(),
-                error: None,
-            };
-        }
-    }
-}
-
-fn handle_token_pasted(
-    state: &mut AppState,
-    token: String,
-    config: &Config,
-    event_tx: mpsc::Sender<AppEvent>,
-) {
-    if let AppState::WaitingForToken { profile_name, .. } = state {
-        let client_id = config.client_id.clone().unwrap_or_default();
-        let tx = event_tx.clone();
-        let profile_name_clone = profile_name.clone();
-
-        tokio::spawn(async move {
-            let auth_result: Result<UserToken, eyre::Report> = async {
-                let auth_client =
-                    AuthClient::new(client_id, tx.clone(), profile_name_clone).await?;
-                let user_token = auth_client.validate_pasted_token(token).await?;
-                auth_client.save_token(&user_token).await?;
-                Ok(user_token)
+            tracing::info!("Silent login failed: {}", e);
+            if config.profiles.is_empty() {
+                tracing::info!("No profiles found. Proceeding to first time setup.");
+                *state = AppState::FirstTimeSetup {
+                    client_id_input: String::new(),
+                    client_secret_input: String::new(),
+                    profile_name_input: String::new(),
+                    error: None,
+                };
+            } else {
+                tracing::info!("Profiles found. Proceeding to profile selection.");
+                *state = AppState::ProfileSelection { error: None };
             }
-            .await;
-
-            let event = match auth_result {
-                Ok(token) => AppEvent::Auth(AuthMessage::Success(token)),
-                Err(e) => AppEvent::Auth(AuthMessage::Error(e.to_string())),
-            };
-            tx.send(event).await.ok();
-        });
+        }
     }
 }
 
@@ -131,28 +116,22 @@ fn handle_auth_message(
     config: &mut Config,
     event_tx: mpsc::Sender<AppEvent>,
 ) {
-    let old_state = mem::replace(state, AppState::Startup { task_spawned: true });
-
-    if let AppState::WaitingForToken {
-        profile_name,
-        token_input,
-        ..
-    } = old_state
-    {
-        match msg {
-            AuthMessage::Success(token) => {
-                handle_successful_login(state, token, config, event_tx, profile_name);
-            }
-            AuthMessage::Error(err) => {
-                *state = AppState::WaitingForToken {
-                    profile_name,
-                    token_input,
-                    error: Some(format!("Authentication Failed: {}", err)),
-                };
-            }
+    match msg {
+        AuthMessage::Success(token) => {
+            // The profile name should already be set in the config from the UI logic
+            let profile_name = config.active_profile_name.clone();
+            handle_successful_login(state, token, config, event_tx, profile_name);
         }
-    } else {
-        *state = old_state;
+        AuthMessage::Error(err) => {
+            // If auth fails, we go back to the first time setup screen to show the error.
+            // This covers cases where the user denies auth in the browser.
+            *state = AppState::FirstTimeSetup {
+                client_id_input: config.client_id.clone().unwrap_or_default(),
+                client_secret_input: config.client_secret.clone().unwrap_or_default(),
+                profile_name_input: config.active_profile_name.clone().unwrap_or_default(),
+                error: Some(format!("Authentication Failed: {}", err)),
+            };
+        }
     }
 }
 
