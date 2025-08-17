@@ -13,6 +13,7 @@ egui_extras = { version = "0.32.0", features = ["image", "http", "gif"] }
 eyre = "0.6.11"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 fontdb = "0.23.0"
+form_urlencoded = "1.2.1"
 futures = "0.3.30"
 http-body-util = "0.1"
 hyper = { version = "1.4.0", features = ["http1", "server"] }

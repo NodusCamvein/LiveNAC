@@ -17,6 +17,7 @@ pub struct Profile {
 #[serde(default)]
 pub struct Config {
     pub client_id: Option<String>,
+    pub client_secret: Option<String>,
     pub enable_cjk_font: bool,
     pub font_size: f32,
     pub emote_size: f32,
@@ -30,6 +31,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             client_id: None,
+            client_secret: None,
             enable_cjk_font: false,
             font_size: 14.0,
             emote_size: 14.0,

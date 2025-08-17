@@ -5,7 +5,7 @@ use crate::{
         state::AppState,
     },
     core::{
-        auth::AuthClient,
+        auth::{AuthClient, AuthMessage},
         chat::{AnnouncementColor, ChatClient},
         eventsub::EventSubClient,
     },
@@ -171,7 +171,8 @@ impl eframe::App for App {
         let mut send_action: Option<bool> = None;
         let mut login_action: Option<bool> = None;
 
-        let mut cancel_auth_action = false;
+        let cancel_auth_action = false;
+        let mut trigger_interactive_login_for_profile: Option<String> = None;
 
         match &mut self.state {
             AppState::Startup { task_spawned } => {
@@ -196,9 +197,17 @@ impl eframe::App for App {
                             }
                         };
 
-                        if let Some(client_id) = config.client_id.clone() {
+                        if let (Some(client_id), Some(client_secret)) =
+                            (config.client_id.clone(), config.client_secret.clone())
+                        {
                             let active_profile_name = config.active_profile_name.clone();
-                            match AuthClient::new(client_id, tx.clone(), active_profile_name).await
+                            match AuthClient::new(
+                                client_id,
+                                client_secret,
+                                tx.clone(),
+                                active_profile_name,
+                            )
+                            .await
                             {
                                 Ok(auth_client) => {
                                     let result = auth_client.try_silent_login().await;
@@ -220,8 +229,8 @@ impl eframe::App for App {
                 self.draw_loading_ui(ctx, "Starting...");
             }
             AppState::FirstTimeSetup { .. } => self.draw_first_time_setup(ctx, &mut login_action),
-            AppState::WaitingForToken { .. } => {
-                self.draw_waiting_for_token_ui(ctx, &mut cancel_auth_action)
+            AppState::RequestingInteractiveLogin { profile_name } => {
+                trigger_interactive_login_for_profile = Some(profile_name.clone());
             }
             AppState::LoggedIn { .. } => self.draw_logged_in(ctx, &mut send_action),
         }
@@ -232,6 +241,9 @@ impl eframe::App for App {
         }
         if let Some(true) = login_action {
             self.handle_login_action();
+        }
+        if let Some(profile_name) = trigger_interactive_login_for_profile {
+            self.trigger_interactive_login(Some(profile_name));
         }
         if cancel_auth_action {
             // Use try_send to avoid blocking the UI thread.
@@ -248,41 +260,86 @@ impl App {
         self.trigger_interactive_login(profile_name);
     }
 
-    fn trigger_interactive_login(&mut self, profile_name: Option<String>) {
-        let client_id = self.config.client_id.clone().unwrap_or_default();
+    fn handle_profile_switch(&mut self, profile_name: String) {
+        self.config.active_profile_name = Some(profile_name.clone());
+        self.show_profile_manager = false;
+        self.state = AppState::Startup {
+            task_spawned: true, // Prevent main startup logic from running
+        };
+
         let tx = self.event_tx.clone();
+        let client_id = self.config.client_id.clone().unwrap_or_default();
+        let client_secret = self.config.client_secret.clone().unwrap_or_default();
         let profile_name_clone = profile_name.clone();
 
         tokio::spawn(async move {
-            let auth_client = match AuthClient::new(client_id, tx.clone(), profile_name_clone).await
-            {
-                Ok(client) => client,
-                Err(e) => {
-                    tx.send(AppEvent::AuthFlowStartFailed(format!(
-                        "Failed to create auth client: {}",
-                        e
-                    )))
+            let auth_client =
+                match AuthClient::new(client_id, client_secret, tx.clone(), Some(profile_name_clone.clone()))
                     .await
-                    .ok();
-                    return;
-                }
-            };
+                {
+                    Ok(client) => client,
+                    Err(e) => {
+                        tx.send(AppEvent::ProfileSwitchSilentLoginComplete(Err(e), profile_name_clone))
+                            .await
+                            .ok();
+                        return;
+                    }
+                };
 
-            if let Err(e) = auth_client.start_interactive_login().await {
-                tx.send(AppEvent::AuthFlowStartFailed(format!(
-                    "Failed to start interactive login: {}",
-                    e
-                )))
+            let result = auth_client.try_silent_login().await;
+            tx.send(AppEvent::ProfileSwitchSilentLoginComplete(result, profile_name_clone))
                 .await
                 .ok();
+        });
+    }
+
+    fn trigger_interactive_login(&mut self, profile_name: Option<String>) {
+        let client_id = self.config.client_id.clone().unwrap_or_default();
+        let client_secret = self.config.client_secret.clone().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        let profile_name_clone = profile_name.clone();
+
+        self.state = AppState::Startup {
+            task_spawned: true, // Prevent re-triggering silent auth
+        };
+
+        tokio::spawn(async move {
+            let auth_client =
+                match AuthClient::new(client_id, client_secret, tx.clone(), profile_name_clone)
+                    .await
+                {
+                    Ok(client) => client,
+                    Err(e) => {
+                        tx.send(AppEvent::AuthFlowStartFailed(format!(
+                            "Failed to create auth client: {}",
+                            e
+                        )))
+                        .await
+                        .ok();
+                        return;
+                    }
+                };
+
+            match auth_client.clone().start_interactive_login().await {
+                Ok(token) => {
+                    if let Err(e) = auth_client.save_token(&token).await {
+                        tx.send(AppEvent::Auth(AuthMessage::Error(format!(
+                            "Failed to save token: {}",
+                            e
+                        ))))
+                        .await
+                        .ok();
+                    } else {
+                        tx.send(AppEvent::Auth(AuthMessage::Success(token))).await.ok();
+                    }
+                }
+                Err(e) => {
+                    tx.send(AppEvent::Auth(AuthMessage::Error(e.to_string())))
+                        .await
+                        .ok();
+                }
             }
         });
-
-        self.state = AppState::WaitingForToken {
-            profile_name,
-            token_input: String::new(),
-            error: None,
-        };
     }
 
     fn apply_settings(&mut self, ctx: &egui::Context) {
@@ -308,16 +365,18 @@ impl App {
     fn draw_first_time_setup(&mut self, ctx: &egui::Context, login_action: &mut Option<bool>) {
         if let AppState::FirstTimeSetup {
             client_id_input,
+            client_secret_input,
             profile_name_input,
             error,
         } = &mut self.state
         {
             let mut profile_input_resp = None;
             let mut client_id_input_resp = None;
+            let mut client_secret_input_resp = None;
 
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                    ui.add_space(ui.available_height() * 0.2);
+                    ui.add_space(ui.available_height() * 0.15);
                     ui.heading("LiveNAC");
                     ui.label("Twitch Chat Client");
                     ui.label("First-Time Setup");
@@ -331,8 +390,12 @@ impl App {
                     if !client_id_exists {
                         ui.label("Twitch Application Client ID:");
                         client_id_input_resp = Some(ui.text_edit_singleline(client_id_input));
+                        ui.add_space(10.0);
+                        ui.label("Twitch Application Client Secret:");
+                        client_secret_input_resp =
+                            Some(ui.add(egui::TextEdit::singleline(client_secret_input).password(true)));
                     } else {
-                        ui.label(RichText::new("Client ID found in config.").italics());
+                        ui.label(RichText::new("Client ID and Secret found in config.").italics());
                     }
                 });
 
@@ -342,18 +405,22 @@ impl App {
                     let enter_pressed = (profile_input_resp.as_ref().unwrap().lost_focus()
                         || client_id_input_resp
                             .as_ref()
+                            .map_or(false, |r| r.lost_focus())
+                        || client_secret_input_resp
+                            .as_ref()
                             .map_or(false, |r| r.lost_focus()))
                         && ctx.input(|i| i.key_pressed(Key::Enter));
 
                     if ui.button("Login with Twitch").clicked() || enter_pressed {
                         let client_id_exists = self.config.client_id.is_some();
                         if !client_id_exists {
-                            if client_id_input.is_empty() {
-                                *error = Some("Client ID cannot be empty.".to_string());
+                            if client_id_input.is_empty() || client_secret_input.is_empty() {
+                                *error =
+                                    Some("Client ID and Secret cannot be empty.".to_string());
                                 return;
                             }
-                            // Set the client_id in the config if it was just entered.
                             self.config.client_id = Some(client_id_input.clone());
+                            self.config.client_secret = Some(client_secret_input.clone());
                         }
 
                         if profile_name_input.is_empty() {
@@ -381,59 +448,32 @@ impl App {
         }
     }
 
-    fn draw_waiting_for_token_ui(&mut self, ctx: &egui::Context, cancel_auth_action: &mut bool) {
-        if let AppState::WaitingForToken {
-            token_input,
-            error,
-            ..
-        } = &mut self.state
-        {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                        ui.heading("Awaiting Token");
-                        ui.label("Please copy the token from your browser and paste it below.");
-                        ui.add_space(10.0);
-
-                        let token_input_field = ui.text_edit_singleline(token_input);
-
-                        let submit_clicked = ui.button("Submit Token").clicked();
-                        let enter_pressed = token_input_field.lost_focus()
-                            && ctx.input(|i| i.key_pressed(Key::Enter));
-
-                        if submit_clicked || enter_pressed {
-                            self.event_tx
-                                .try_send(AppEvent::TokenPasted(token_input.clone()))
-                                .ok();
-                        }
-
-                        if ui.button("Cancel").clicked() {
-                            *cancel_auth_action = true;
-                        }
-
-                        if let Some(err) = error {
-                            ui.add_space(10.0);
-                            ui.colored_label(egui::Color32::RED, err);
-                        }
-                    });
-                });
-            });
-        }
-    }
-
     fn draw_logged_in(&mut self, ctx: &egui::Context, send_action: &mut Option<bool>) {
         if let AppState::LoggedIn {
             user_login,
             channel_to_join,
             current_channel,
             chat_messages,
-
+            last_error,
             token,
             user_id,
             eventsub_task,
             ..
         } = &mut self.state
         {
+            if last_error.is_some() {
+                TopBottomPanel::top("error_panel")
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Error:");
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                last_error.as_ref().unwrap(),
+                            );
+                        });
+                    });
+            }
+
             TopBottomPanel::top("top_panel").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("☰").clicked() {
@@ -469,6 +509,7 @@ impl App {
                         if let Some(task) = eventsub_task.take() {
                             task.abort();
                         }
+                        *last_error = None;
                         chat_messages.clear();
                         *current_channel = Some(channel_to_join.clone());
                         let tx = self.event_tx.clone();
@@ -587,7 +628,7 @@ impl App {
                     match action {
                         profiles::ProfileManagerAction::Login(name) => {
                             self.profile_manager_error = None;
-                            self.trigger_interactive_login(Some(name));
+                            self.handle_profile_switch(name);
                         }
                         profiles::ProfileManagerAction::Add(name) => {
                             if !self.config.profiles.iter().any(|p| p.name == name) {

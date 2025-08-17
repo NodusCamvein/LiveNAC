@@ -15,13 +15,12 @@ pub enum AppState {
     },
     FirstTimeSetup {
         client_id_input: String,
+        client_secret_input: String,
         profile_name_input: String,
         error: Option<String>,
     },
-    WaitingForToken {
-        profile_name: Option<String>,
-        token_input: String,
-        error: Option<String>,
+    RequestingInteractiveLogin {
+        profile_name: String,
     },
     LoggedIn {
         token: Arc<UserToken>,
