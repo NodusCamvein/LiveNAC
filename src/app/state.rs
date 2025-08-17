@@ -10,14 +10,18 @@ use twitch_types::UserId;
 
 /// Represents the various states of the application's lifecycle.
 pub enum AppState {
-    Startup,
+    Startup {
+        task_spawned: bool,
+    },
     FirstTimeSetup {
         client_id_input: String,
         profile_name_input: String,
         error: Option<String>,
     },
-    Authenticating {
-        status_message: String,
+    WaitingForToken {
+        profile_name: Option<String>,
+        token_input: String,
+        error: Option<String>,
     },
     LoggedIn {
         token: Arc<UserToken>,

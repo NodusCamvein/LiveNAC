@@ -5,7 +5,7 @@ use crate::{
         message::{ChatMessage, MessageFragment},
     },
 };
-use chrono::Utc;
+use chrono::Local;
 use eyre::eyre;
 use futures::StreamExt;
 use reqwest::Client as ReqwestClient;
@@ -196,7 +196,7 @@ impl EventSubClient {
                     sender_name: chatter_display_name.to_string(),
                     sender_color,
                     fragments,
-                    timestamp: Utc::now(),
+                    timestamp: Local::now(),
                 };
 
                 let msg = AppEvent::Chat(ChatEvent::NewChatMessage(message));

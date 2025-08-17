@@ -16,6 +16,11 @@ pub fn draw_chat_log(ui: &mut egui::Ui, state: &mut AppState, config: &Config) {
                     ui.horizontal_wrapped(|ui| {
                         ui.set_min_height(config.emote_size);
 
+                        if config.show_timestamps {
+                            let timestamp_str = message.timestamp.format("[%H:%M:%S]").to_string();
+                            ui.label(RichText::new(timestamp_str).color(Color32::from_gray(128)));
+                        }
+
                         if config.collapse_emotes {
                             // This is a bit of a hack, but it's the easiest way to
                             // remove the space between emotes.

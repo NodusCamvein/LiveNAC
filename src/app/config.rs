@@ -14,11 +14,13 @@ pub struct Profile {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
 pub struct Config {
     pub client_id: Option<String>,
     pub enable_cjk_font: bool,
     pub font_size: f32,
     pub emote_size: f32,
+    pub show_timestamps: bool,
     pub collapse_emotes: bool,
     pub profiles: Vec<Profile>,
     pub active_profile_name: Option<String>,
@@ -31,6 +33,7 @@ impl Default for Config {
             enable_cjk_font: false,
             font_size: 14.0,
             emote_size: 14.0,
+            show_timestamps: false,
             collapse_emotes: false,
             profiles: Vec::new(),
             active_profile_name: None,

@@ -1,12 +1,15 @@
 use super::state::AppState;
 use crate::{
     app::config::Config,
-    core::{auth::AuthMessage, chat::ChatClient},
+    core::{
+        auth::{AuthClient, AuthMessage},
+        chat::ChatClient,
+    },
     emotes::twitch_api::TwitchApiClient,
     events::app_event::{AppEvent, ChatEvent},
     models::{message::MessageFragment, user::User},
 };
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, mem, sync::Arc};
 use tokio::sync::mpsc;
 use twitch_oauth2::UserToken;
 
@@ -21,10 +24,30 @@ pub fn reduce(
             handle_config_loaded(config_result, config);
         }
         AppEvent::SilentLoginComplete(result) => {
-            handle_silent_login_complete(state, result, config, event_tx);
+            handle_silent_login_complete(state, result, config, event_tx.clone());
         }
         AppEvent::Auth(auth_message) => {
-            handle_auth_message(state, auth_message, config, event_tx);
+            handle_auth_message(state, auth_message, config, event_tx.clone());
+        }
+        AppEvent::AuthCancel => {
+            if let AppState::WaitingForToken { .. } = state {
+                tracing::info!("Authentication cancelled by user.");
+                *state = AppState::Startup {
+                    task_spawned: false,
+                };
+            }
+        }
+        AppEvent::TokenPasted(token) => {
+            handle_token_pasted(state, token, config, event_tx.clone());
+        }
+        AppEvent::AuthFlowStartFailed(err) => {
+            // If the auth flow fails to even start, the best we can do is go back
+            // to the setup screen and display an error.
+            *state = AppState::FirstTimeSetup {
+                client_id_input: config.client_id.clone().unwrap_or_default(),
+                profile_name_input: String::new(),
+                error: Some(err),
+            };
         }
         AppEvent::Chat(chat_message) => {
             handle_chat_message(state, chat_message);
@@ -49,8 +72,6 @@ fn handle_config_loaded(result: Result<Config, eyre::Report>, config: &mut Confi
     if let Ok(loaded_config) = result {
         *config = loaded_config;
     }
-    // If config loading fails, the app will proceed to the FirstTimeSetup state
-    // driven by the SilentLoginComplete event failing.
 }
 
 fn handle_silent_login_complete(
@@ -61,16 +82,46 @@ fn handle_silent_login_complete(
 ) {
     match result {
         Ok(token) => {
-            handle_successful_login(state, token, config, event_tx);
+            handle_successful_login(state, token, config, event_tx, None);
         }
         Err(e) => {
             tracing::info!("Silent login failed: {}. Proceeding to first time setup.", e);
             *state = AppState::FirstTimeSetup {
                 client_id_input: String::new(),
                 profile_name_input: String::new(),
-                error: None, // Don't show an error here, it's expected on first launch.
+                error: None,
             };
         }
+    }
+}
+
+fn handle_token_pasted(
+    state: &mut AppState,
+    token: String,
+    config: &Config,
+    event_tx: mpsc::Sender<AppEvent>,
+) {
+    if let AppState::WaitingForToken { profile_name, .. } = state {
+        let client_id = config.client_id.clone().unwrap_or_default();
+        let tx = event_tx.clone();
+        let profile_name_clone = profile_name.clone();
+
+        tokio::spawn(async move {
+            let auth_result: Result<UserToken, eyre::Report> = async {
+                let auth_client =
+                    AuthClient::new(client_id, tx.clone(), profile_name_clone).await?;
+                let user_token = auth_client.validate_pasted_token(token).await?;
+                auth_client.save_token(&user_token).await?;
+                Ok(user_token)
+            }
+            .await;
+
+            let event = match auth_result {
+                Ok(token) => AppEvent::Auth(AuthMessage::Success(token)),
+                Err(e) => AppEvent::Auth(AuthMessage::Error(e.to_string())),
+            };
+            tx.send(event).await.ok();
+        });
     }
 }
 
@@ -80,19 +131,28 @@ fn handle_auth_message(
     config: &mut Config,
     event_tx: mpsc::Sender<AppEvent>,
 ) {
-    if let AppState::Authenticating { .. } = state {
+    let old_state = mem::replace(state, AppState::Startup { task_spawned: true });
+
+    if let AppState::WaitingForToken {
+        profile_name,
+        token_input,
+        ..
+    } = old_state
+    {
         match msg {
             AuthMessage::Success(token) => {
-                handle_successful_login(state, token, config, event_tx);
+                handle_successful_login(state, token, config, event_tx, profile_name);
             }
             AuthMessage::Error(err) => {
-                *state = AppState::FirstTimeSetup {
-                    client_id_input: String::new(),
-                    profile_name_input: String::new(),
+                *state = AppState::WaitingForToken {
+                    profile_name,
+                    token_input,
                     error: Some(format!("Authentication Failed: {}", err)),
-                }
+                };
             }
         }
+    } else {
+        *state = old_state;
     }
 }
 
@@ -101,13 +161,22 @@ fn handle_successful_login(
     token: UserToken,
     config: &mut Config,
     event_tx: mpsc::Sender<AppEvent>,
+    auth_profile_name: Option<String>,
 ) {
     let user_id = token.user_id.clone();
     let user_login = token.login.clone();
 
-    // If there's no active profile, this must be the first login.
-    // Create a new profile based on the twitch login name.
-    if config.active_profile_name.is_none() {
+    if let Some(name) = auth_profile_name {
+        config.active_profile_name = Some(name);
+    }
+
+    if let Some(name) = &config.active_profile_name {
+        if let Some(profile) = config.profiles.iter_mut().find(|p| &p.name == name) {
+            if profile.twitch_user_id.is_none() {
+                profile.twitch_user_id = Some(user_id.to_string());
+            }
+        }
+    } else {
         let new_profile_name = user_login.to_string();
         config.profiles.push(crate::app::config::Profile {
             name: new_profile_name.clone(),
@@ -116,16 +185,6 @@ fn handle_successful_login(
         config.active_profile_name = Some(new_profile_name);
     }
 
-    // Update twitch_user_id for the active profile, in case it was missing.
-    if let Some(name) = &config.active_profile_name {
-        if let Some(profile) = config.profiles.iter_mut().find(|p| &p.name == name) {
-            if profile.twitch_user_id.is_none() {
-                profile.twitch_user_id = Some(user_id.to_string());
-            }
-        }
-    }
-
-    // Save the updated config
     let config_to_save = config.clone();
     tokio::spawn(async move {
         if let Err(e) = crate::app::config::save(&config_to_save).await {

@@ -1,16 +1,16 @@
 use crate::events::app_event::AppEvent;
 use dirs;
 use eyre::{eyre, Context};
-use http_body_util::{BodyExt, Full};
-use hyper::{body::Bytes, server::conn::http1, service::service_fn, Method, Request, Response, StatusCode};
+use http_body_util::Full;
+use hyper::{body::Bytes, server::conn::http1, service::service_fn, Method, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use reqwest::Client as ReqwestClient;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    sync::{mpsc, oneshot},
+    sync::mpsc,
 };
 use twitch_oauth2::{AccessToken, RefreshToken, UserToken};
 use url::Url;
@@ -38,6 +38,7 @@ pub struct AuthClient {
     scopes: Vec<twitch_oauth2::Scope>,
     client_id: twitch_oauth2::ClientId,
     data_path: PathBuf,
+    // No longer needed for interactive flow, but might be useful for silent flow errors.
     ui_message_tx: mpsc::Sender<AppEvent>,
     active_profile_name: Option<String>,
 }
@@ -82,6 +83,7 @@ impl AuthClient {
         })
     }
 
+    /// Attempts to load and validate a token from disk for the active profile.
     pub async fn try_silent_login(&self) -> Result<UserToken, eyre::Report> {
         if self.active_profile_name.is_none() {
             return Err(eyre!("No active profile selected."));
@@ -89,41 +91,23 @@ impl AuthClient {
         self.load_and_validate_token().await
     }
 
-    pub async fn interactive_login(self) {
+    /// Kicks off the interactive login flow.
+    /// This will start a short-lived local server and open the user's browser.
+    /// The app's UI is responsible for changing state to wait for the user to paste the token.
+    pub async fn start_interactive_login(self) -> Result<(), eyre::Report> {
         tracing::info!("Starting interactive login flow...");
-        if let Err(e) = self.run_browser_flow().await {
-            tracing::error!("Browser flow failed: {}", e);
-            self.send_message(AuthMessage::Error(format!("Authentication failed: {}", e)))
-                .await;
-        }
-    }
-
-    async fn load_and_validate_token(&self) -> Result<UserToken, eyre::Report> {
-        tracing::info!("Attempting to load token from disk...");
-        let stored = self.load_token_from_disk().await?;
-        let access_token = AccessToken::new(stored.access_token);
-
-        let validated = tokio::time::timeout(
-            Duration::from_secs(10),
-            access_token.validate_token(&self.reqwest_client),
-        )
-        .await
-        .context("Token validation timed out")?
-        .context("Failed to validate token")?;
-
-        let token = UserToken::new(access_token, None::<RefreshToken>, validated, None)?;
-
-        tracing::info!("Token is valid.");
-        Ok(token)
-    }
-
-    async fn run_browser_flow(&self) -> Result<(), eyre::Report> {
-        let (token_tx, token_rx) = oneshot::channel();
 
         let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-        let listener = TcpListener::bind(addr).await?;
+        let listener = match TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("Failed to bind to port 3000. Is another instance of the app running? Error: {}", e);
+                return Err(eyre!("Could not start local server on port 3000. It might already be in use. OS error: {}", e));
+            }
+        };
 
-        let server_handle = tokio::spawn(run_server(listener, token_tx));
+        // Spawn the server. It will shut down on its own after one connection.
+        tokio::spawn(run_single_use_server(listener));
 
         let scope_str = self
             .scopes
@@ -149,31 +133,48 @@ impl AuthClient {
             );
         }
 
-        tokio::select! {
-            token_result = token_rx => {
-                server_handle.abort();
-                match token_result {
-                    Ok(token) => {
-                        let validated = token.validate_token(&self.reqwest_client).await?;
-                        let full_token = UserToken::new(token.clone(), None::<RefreshToken>, validated, None)?;
-                        self.save_token_to_disk(&token).await?;
-                        self.send_message(AuthMessage::Success(full_token)).await;
-                        Ok(())
-                    }
-                    Err(_) => {
-                        let err_msg = "The authentication server was closed before a token was received.".to_string();
-                        self.send_message(AuthMessage::Error(err_msg.clone())).await;
-                        Err(eyre!(err_msg))
-                    }
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_secs(600)) => {
-                server_handle.abort();
-                let err_msg = "Login timed out after 10 minutes.".to_string();
-                self.send_message(AuthMessage::Error(err_msg.clone())).await;
-                Err(eyre!(err_msg))
-            }
-        }
+        Ok(())
+    }
+
+    /// Validates a token that was pasted by the user.
+    pub async fn validate_pasted_token(&self, token_str: String) -> Result<UserToken, eyre::Report> {
+        let access_token = AccessToken::new(token_str);
+
+        let validated = tokio::time::timeout(
+            Duration::from_secs(10),
+            access_token.validate_token(&self.reqwest_client),
+        )
+        .await
+        .context("Token validation timed out")?
+        .context("Failed to validate token")?;
+
+        let token = UserToken::new(access_token, None::<RefreshToken>, validated, None)?;
+
+        tracing::info!("Pasted token is valid.");
+        Ok(token)
+    }
+    
+    pub async fn save_token(&self, token: &UserToken) -> Result<(), eyre::Report> {
+        self.save_token_to_disk(&token.access_token).await
+    }
+
+    async fn load_and_validate_token(&self) -> Result<UserToken, eyre::Report> {
+        tracing::info!("Attempting to load token from disk...");
+        let stored = self.load_token_from_disk().await?;
+        let access_token = AccessToken::new(stored.access_token);
+
+        let validated = tokio::time::timeout(
+            Duration::from_secs(10),
+            access_token.validate_token(&self.reqwest_client),
+        )
+        .await
+        .context("Token validation timed out")?
+        .context("Failed to validate token")?;
+
+        let token = UserToken::new(access_token, None::<RefreshToken>, validated, None)?;
+
+        tracing::info!("Token is valid.");
+        Ok(token)
     }
 
     fn get_token_path(&self) -> Result<PathBuf, eyre::Report> {
@@ -214,6 +215,7 @@ impl AuthClient {
         Ok(token)
     }
 
+    #[allow(dead_code)]
     async fn send_message(&self, msg: AuthMessage) {
         if self.ui_message_tx.send(AppEvent::Auth(msg)).await.is_err() {
             tracing::error!("Failed to send message to UI thread: channel is closed.");
@@ -221,61 +223,27 @@ impl AuthClient {
     }
 }
 
-async fn run_server(listener: TcpListener, token_tx: oneshot::Sender<AccessToken>) {
-    let token_tx = Arc::new(tokio::sync::Mutex::new(Some(token_tx)));
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(s) => s,
-            Err(_) => return, // Listener was closed
-        };
+/// A web server that accepts only one connection, serves the success page, and then shuts down.
+async fn run_single_use_server(listener: TcpListener) {
+    if let Ok((stream, _)) = listener.accept().await {
+        let io = TokioIo::new(stream);
 
-        let token_tx_clone = token_tx.clone();
-
-        tokio::task::spawn(async move {
-            let io = TokioIo::new(stream);
-            let service = service_fn(move |req| handle_request(req, token_tx_clone.clone()));
-
-            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                tracing::debug!("Server connection error: {}", err);
+        let service = service_fn(move |req| async move {
+            match (req.method(), req.uri().path()) {
+                (&Method::GET, "/") => {
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(HTML_LANDING_PAGE))))
+                }
+                _ => {
+                    let mut not_found = Response::new(Full::new(Bytes::from("Not Found")));
+                    *not_found.status_mut() = StatusCode::NOT_FOUND;
+                    Ok(not_found)
+                }
             }
         });
-    }
-}
 
-async fn handle_request(
-    req: Request<hyper::body::Incoming>,
-    token_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<AccessToken>>>>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    match (req.method(), req.uri().path()) {
-        (&Method::GET, "/") => Ok(Response::new(Full::new(Bytes::from(HTML_LANDING_PAGE)))),
-        (&Method::POST, "/token") => {
-            let whole_body = req.into_body().collect().await?.to_bytes();
-            let token_data: serde_json::Value = match serde_json::from_slice(&whole_body) {
-                Ok(data) => data,
-                Err(_) => {
-                    let mut response = Response::new(Full::new(Bytes::from("Bad Request")));
-                    *response.status_mut() = StatusCode::BAD_REQUEST;
-                    return Ok(response);
-                }
-            };
-
-            let access_token_str = token_data["access_token"].as_str().unwrap_or_default();
-            let access_token = twitch_oauth2::AccessToken::new(access_token_str.to_string());
-
-            if let Some(tx) = token_tx.lock().await.take() {
-                if tx.send(access_token).is_ok() {
-                    return Ok(Response::new(Full::new(Bytes::from("OK"))));
-                }
-            }
-
-            let mut response = Response::new(Full::new(Bytes::from("Internal Server Error")));
-            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            Ok(response)
-        }
-        _ => {
-            let mut not_found = Response::new(Full::new(Bytes::from("Not Found")));
-            *not_found.status_mut() = StatusCode::NOT_FOUND;
-            Ok(not_found)
+        if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+            tracing::debug!("Server connection error: {}", err);
         }
     }
+    tracing::info!("Single-use server shutting down.");
 }

@@ -9,6 +9,9 @@ pub enum AppEvent {
     ConfigLoaded(Result<Config, eyre::Report>),
     SilentLoginComplete(Result<UserToken, eyre::Report>),
     Auth(AuthMessage),
+    AuthCancel,
+    TokenPasted(String),
+    AuthFlowStartFailed(String),
     Chat(ChatEvent),
     GlobalEmotesLoaded(Result<Vec<TwitchEmote>, String>),
 }
