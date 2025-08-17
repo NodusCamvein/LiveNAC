@@ -1,7 +1,7 @@
 use crate::{
     app::{config::Config, state::AppState},
     models::message::MessageFragment,
-    utils::text_processing::{parse_text_for_urls, TextOrUrl},
+    utils::text_processing::{TextOrUrl, parse_text_for_urls},
 };
 use eframe::egui::{self, Color32, Image, RichText, ScrollArea, Vec2};
 
@@ -70,11 +70,9 @@ pub fn draw_chat_log(ui: &mut egui::Ui, state: &mut AppState, config: &Config) {
 
                                     let source_text = format!("{:?}", emote.source);
 
-                                    let _response = ui.add(image.sense(egui::Sense::click()))
-                                        .on_hover_text(format!(
-                                            "{} - {}",
-                                            emote.name, source_text
-                                        ));
+                                    let _response = ui
+                                        .add(image.sense(egui::Sense::click()))
+                                        .on_hover_text(format!("{} - {}", emote.name, source_text));
                                 }
                             }
                         }

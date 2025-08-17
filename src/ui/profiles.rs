@@ -78,7 +78,11 @@ pub fn draw_profiles_ui(
             ui.label("Select Profile:");
 
             // If profile_to_remove_name is not a valid profile, reset it.
-            if !config.profiles.iter().any(|p| p.name == *profile_to_remove_name) {
+            if !config
+                .profiles
+                .iter()
+                .any(|p| p.name == *profile_to_remove_name)
+            {
                 if let Some(first_profile) = config.profiles.first() {
                     *profile_to_remove_name = first_profile.name.clone();
                 }
@@ -98,9 +102,7 @@ pub fn draw_profiles_ui(
 
             let remove_button_clicked = ui.button("Remove").clicked();
             if remove_button_clicked && !profile_to_remove_name.is_empty() {
-                action = Some(ProfileManagerAction::Remove(
-                    profile_to_remove_name.clone(),
-                ));
+                action = Some(ProfileManagerAction::Remove(profile_to_remove_name.clone()));
             }
         });
     } else {

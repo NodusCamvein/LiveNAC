@@ -1,9 +1,9 @@
 pub mod app;
 pub mod core;
+pub mod emotes;
 pub mod error;
 pub mod events;
 pub mod features;
 pub mod models;
-pub mod emotes;
 pub mod ui;
 pub mod utils;

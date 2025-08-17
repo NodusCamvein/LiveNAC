@@ -1,12 +1,12 @@
 use crate::events::app_event::AppEvent;
 use dirs;
-use eyre::{eyre, Context};
+use eyre::{Context, eyre};
 use http_body_util::Full;
 use hyper::{
+    Request, Response,
     body::{Bytes, Incoming},
     server::conn::http1,
     service::service_fn,
-    Request, Response,
 };
 use hyper_util::rt::TokioIo;
 use reqwest::Client as ReqwestClient;
@@ -22,7 +22,7 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use twitch_oauth2::{AccessToken, RefreshToken, UserToken, UserTokenBuilder};
-use url::{form_urlencoded, Url};
+use url::{Url, form_urlencoded};
 
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const TOKEN_FILE_NAME: &str = "token.json";
@@ -110,10 +110,13 @@ impl AuthClient {
 
         let redirect_uri = Url::parse(REDIRECT_URI).expect("is known-good").into();
 
-        let mut builder =
-            UserTokenBuilder::new(self.client_id.clone(), self.client_secret.clone(), redirect_uri)
-                .set_scopes(self.scopes.clone())
-                .force_verify(true);
+        let mut builder = UserTokenBuilder::new(
+            self.client_id.clone(),
+            self.client_secret.clone(),
+            redirect_uri,
+        )
+        .set_scopes(self.scopes.clone())
+        .force_verify(true);
 
         let (auth_url, _csrf_token) = builder.generate_url();
 

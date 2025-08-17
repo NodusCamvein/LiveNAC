@@ -13,15 +13,13 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use twitch_api::{
+    HelixClient,
     eventsub::{
+        Event, Message, Transport,
         channel::ChannelChatMessageV1,
         event::websocket::{EventsubWebsocketData, WelcomePayload},
-        Event, Message, Transport,
     },
-    helix::eventsub::{
-        CreateEventSubSubscriptionBody, CreateEventSubSubscriptionRequest,
-    },
-    HelixClient,
+    helix::eventsub::{CreateEventSubSubscriptionBody, CreateEventSubSubscriptionRequest},
 };
 use twitch_oauth2::UserToken;
 use twitch_types::UserId;
@@ -147,7 +145,8 @@ impl EventSubClient {
 
         tracing::info!(
             "Created subscription: {:?}, status: {:?}",
-            subscription.data.type_, subscription.data.status
+            subscription.data.type_,
+            subscription.data.status
         );
         Ok(())
     }

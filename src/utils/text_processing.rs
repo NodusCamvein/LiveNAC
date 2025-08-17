@@ -17,9 +17,7 @@ pub fn parse_text_for_urls(text: &str) -> Vec<TextOrUrl> {
 
     for mat in URL_REGEX.find_iter(text) {
         if mat.start() > last_end {
-            result.push(TextOrUrl::Text(
-                text[last_end..mat.start()].to_string(),
-            ));
+            result.push(TextOrUrl::Text(text[last_end..mat.start()].to_string()));
         }
         let mut url = mat.as_str().to_string();
         if !url.starts_with("http://") && !url.starts_with("https://") {

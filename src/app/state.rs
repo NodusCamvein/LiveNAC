@@ -13,11 +13,17 @@ pub enum AppState {
     Startup {
         task_spawned: bool,
     },
+    Initializing {
+        task_spawned: bool,
+    },
     FirstTimeSetup {
         client_id_input: String,
         client_secret_input: String,
         profile_name_input: String,
         error: Option<String>,
+    },
+    LoggedOut {
+        show_profile_manager_on_entry: bool,
     },
     ProfileSelection {
         error: Option<String>,

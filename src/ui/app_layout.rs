@@ -15,7 +15,9 @@ use crate::{
         profiles,
     },
 };
-use eframe::egui::{self, Align, FontDefinitions, Key, Layout, RichText, SidePanel, TopBottomPanel};
+use eframe::egui::{
+    self, Align, FontDefinitions, Key, Layout, RichText, SidePanel, TopBottomPanel,
+};
 use fontdb;
 use tokio::sync::mpsc;
 
@@ -109,8 +111,10 @@ impl App {
 
                     if let Some(font_data) = font_data {
                         let font_name_string = font_name.to_string();
-                        let egui_font_name =
-                            format!("system-{}", font_name_string.to_lowercase().replace(' ', "_"));
+                        let egui_font_name = format!(
+                            "system-{}",
+                            font_name_string.to_lowercase().replace(' ', "_")
+                        );
 
                         fonts.font_data.insert(
                             egui_font_name.clone(),
@@ -165,7 +169,12 @@ impl eframe::App for App {
         self.apply_settings(ctx);
 
         while let Ok(event) = self.event_rx.try_recv() {
-            reducer::reduce(&mut self.state, event, &mut self.config, self.event_tx.clone());
+            reducer::reduce(
+                &mut self.state,
+                event,
+                &mut self.config,
+                self.event_tx.clone(),
+            );
         }
 
         let mut send_action: Option<bool> = None;
@@ -181,31 +190,29 @@ impl eframe::App for App {
                     let tx = self.event_tx.clone();
                     tokio::spawn(async move {
                         let config_result = config::load().await;
-                        let config = match config_result {
-                            Ok(c) => {
-                                tx.send(AppEvent::ConfigLoaded(Ok(c.clone()))).await.ok();
-                                c
-                            }
-                            Err(e) => {
-                                tx.send(AppEvent::ConfigLoaded(Err(e))).await.ok();
-                                tx.send(AppEvent::SilentLoginComplete(Err(eyre!(
-                                    "Failed to load config"
-                                ))))
-                                .await
-                                .ok();
-                                return;
-                            }
-                        };
+                        tx.send(AppEvent::ConfigLoaded(config_result)).await.ok();
+                    });
+                }
+                self.draw_loading_ui(ctx, "Starting...");
+            }
+            AppState::Initializing { task_spawned } => {
+                if !*task_spawned {
+                    *task_spawned = true;
+                    // The config is loaded, now we can check credentials and try to log in.
+                    let tx = self.event_tx.clone();
+                    let config = self.config.clone();
 
+                    config::log_config_status(&config, "Pre-auth task");
+
+                    tokio::spawn(async move {
                         if let (Some(client_id), Some(client_secret)) =
                             (config.client_id.clone(), config.client_secret.clone())
                         {
-                            let active_profile_name = config.active_profile_name.clone();
                             match AuthClient::new(
                                 client_id,
                                 client_secret,
                                 tx.clone(),
-                                active_profile_name,
+                                config.active_profile_name,
                             )
                             .await
                             {
@@ -219,16 +226,18 @@ impl eframe::App for App {
                             }
                         } else {
                             tx.send(AppEvent::SilentLoginComplete(Err(eyre!(
-                                "Client ID not configured"
+                                "Client ID or Secret not configured"
                             ))))
                             .await
                             .ok();
                         }
                     });
                 }
-                self.draw_loading_ui(ctx, "Starting...");
+
+                self.draw_loading_ui(ctx, "Initializing...");
             }
             AppState::FirstTimeSetup { .. } => self.draw_first_time_setup(ctx, &mut login_action),
+            AppState::LoggedOut { .. } => self.draw_logged_out_ui(ctx),
             AppState::ProfileSelection { .. } => self.draw_profile_selection_ui(ctx),
             AppState::RequestingInteractiveLogin { profile_name } => {
                 trigger_interactive_login_for_profile = Some(profile_name.clone());
@@ -264,34 +273,9 @@ impl App {
     fn handle_profile_switch(&mut self, profile_name: String) {
         self.config.active_profile_name = Some(profile_name.clone());
         self.show_profile_manager = false;
-        self.state = AppState::Startup {
-            task_spawned: true, // Prevent main startup logic from running
+        self.state = AppState::Initializing {
+            task_spawned: false,
         };
-
-        let tx = self.event_tx.clone();
-        let client_id = self.config.client_id.clone().unwrap_or_default();
-        let client_secret = self.config.client_secret.clone().unwrap_or_default();
-        let profile_name_clone = profile_name.clone();
-
-        tokio::spawn(async move {
-            let auth_client =
-                match AuthClient::new(client_id, client_secret, tx.clone(), Some(profile_name_clone.clone()))
-                    .await
-                {
-                    Ok(client) => client,
-                    Err(e) => {
-                        tx.send(AppEvent::ProfileSwitchSilentLoginComplete(Err(e), profile_name_clone))
-                            .await
-                            .ok();
-                        return;
-                    }
-                };
-
-            let result = auth_client.try_silent_login().await;
-            tx.send(AppEvent::ProfileSwitchSilentLoginComplete(result, profile_name_clone))
-                .await
-                .ok();
-        });
     }
 
     fn trigger_interactive_login(&mut self, profile_name: Option<String>) {
@@ -331,7 +315,9 @@ impl App {
                         .await
                         .ok();
                     } else {
-                        tx.send(AppEvent::Auth(AuthMessage::Success(token))).await.ok();
+                        tx.send(AppEvent::Auth(AuthMessage::Success(token)))
+                            .await
+                            .ok();
                     }
                 }
                 Err(e) => {
@@ -363,6 +349,52 @@ impl App {
         });
     }
 
+    fn draw_logged_out_ui(&mut self, ctx: &egui::Context) {
+        if let AppState::LoggedOut {
+            show_profile_manager_on_entry,
+        } = &mut self.state
+        {
+            if *show_profile_manager_on_entry {
+                self.show_profile_manager = true;
+                *show_profile_manager_on_entry = false;
+            }
+        }
+
+        TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("☰").clicked() {
+                    self.show_toolbar = !self.show_toolbar;
+                }
+                ui.heading("Not Logged In");
+            });
+
+            if self.show_toolbar {
+                egui::MenuBar::new().ui(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui.button("Exit").clicked() {
+                            std::process::exit(0);
+                        }
+                    });
+                    if ui.button("Settings").clicked() {
+                        self.show_settings_window = true;
+                    }
+                    if ui.button("Profiles").clicked() {
+                        self.show_profile_manager = true;
+                    }
+                });
+            }
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.centered_and_justified(|ui| {
+                ui.heading("Please select a profile to log in.");
+            });
+        });
+
+        self.draw_settings_window(ctx);
+        self.draw_profile_manager_window(ctx);
+    }
+
     fn draw_first_time_setup(&mut self, ctx: &egui::Context, login_action: &mut Option<bool>) {
         if let AppState::FirstTimeSetup {
             client_id_input,
@@ -387,14 +419,16 @@ impl App {
                     profile_input_resp = Some(ui.text_edit_singleline(profile_name_input));
                     ui.add_space(10.0);
 
-                    let client_id_exists = self.config.client_id.is_some();
-                    if !client_id_exists {
+                    let credentials_exist =
+                        self.config.client_id.is_some() && self.config.client_secret.is_some();
+                    if !credentials_exist {
                         ui.label("Twitch Application Client ID:");
                         client_id_input_resp = Some(ui.text_edit_singleline(client_id_input));
                         ui.add_space(10.0);
                         ui.label("Twitch Application Client Secret:");
-                        client_secret_input_resp =
-                            Some(ui.add(egui::TextEdit::singleline(client_secret_input).password(true)));
+                        client_secret_input_resp = Some(
+                            ui.add(egui::TextEdit::singleline(client_secret_input).password(true)),
+                        );
                     } else {
                         ui.label(RichText::new("Client ID and Secret found in config.").italics());
                     }
@@ -413,13 +447,17 @@ impl App {
                         && ctx.input(|i| i.key_pressed(Key::Enter));
 
                     if ui.button("Login with Twitch").clicked() || enter_pressed {
-                        let client_id_exists = self.config.client_id.is_some();
-                        if !client_id_exists {
+                        let credentials_exist =
+                            self.config.client_id.is_some() && self.config.client_secret.is_some();
+                        if !credentials_exist {
                             if client_id_input.is_empty() || client_secret_input.is_empty() {
-                                *error =
-                                    Some("Client ID and Secret cannot be empty.".to_string());
+                                *error = Some("Client ID and Secret cannot be empty.".to_string());
                                 return;
                             }
+                            tracing::info!(
+                                "Setting client_secret from input: {}",
+                                client_secret_input
+                            );
                             self.config.client_id = Some(client_id_input.clone());
                             self.config.client_secret = Some(client_secret_input.clone());
                         }
@@ -428,7 +466,12 @@ impl App {
                             *error = Some("Profile Name cannot be empty.".to_string());
                             return;
                         }
-                        if self.config.profiles.iter().any(|p| p.name == *profile_name_input) {
+                        if self
+                            .config
+                            .profiles
+                            .iter()
+                            .any(|p| p.name == *profile_name_input)
+                        {
                             *error = Some("A profile with this name already exists.".to_string());
                             return;
                         }
@@ -485,16 +528,12 @@ impl App {
         } = &mut self.state
         {
             if last_error.is_some() {
-                TopBottomPanel::top("error_panel")
-                    .show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Error:");
-                            ui.colored_label(
-                                ui.visuals().error_fg_color,
-                                last_error.as_ref().unwrap(),
-                            );
-                        });
+                TopBottomPanel::top("error_panel").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Error:");
+                        ui.colored_label(ui.visuals().error_fg_color, last_error.as_ref().unwrap());
                     });
+                });
             }
 
             TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -606,7 +645,9 @@ impl App {
                 let mut config_changed = false;
 
                 config_changed |= ui
-                    .add(egui::Slider::new(&mut self.config.font_size, 8.0..=24.0).text("Font Size"))
+                    .add(
+                        egui::Slider::new(&mut self.config.font_size, 8.0..=24.0).text("Font Size"),
+                    )
                     .changed();
 
                 config_changed |= ui
@@ -615,9 +656,12 @@ impl App {
                             .text("Emote Size"),
                     )
                     .changed();
-                
+
                 config_changed |= ui
-                    .checkbox(&mut self.config.collapse_emotes, "Collapse space between emotes")
+                    .checkbox(
+                        &mut self.config.collapse_emotes,
+                        "Collapse space between emotes",
+                    )
                     .changed();
 
                 config_changed |= ui

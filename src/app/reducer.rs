@@ -1,10 +1,7 @@
 use super::state::AppState;
 use crate::{
     app::config::Config,
-    core::{
-        auth::AuthMessage,
-        chat::ChatClient,
-    },
+    core::{auth::AuthMessage, chat::ChatClient},
     emotes::twitch_api::TwitchApiClient,
     events::app_event::{AppEvent, ChatEvent},
     models::{message::MessageFragment, user::User},
@@ -21,24 +18,24 @@ pub fn reduce(
 ) {
     match event {
         AppEvent::ConfigLoaded(config_result) => {
-            handle_config_loaded(config_result, config);
+            handle_config_loaded(config_result, state, config);
         }
         AppEvent::SilentLoginComplete(result) => {
             handle_silent_login_complete(state, result, config, event_tx.clone());
         }
-        AppEvent::ProfileSwitchSilentLoginComplete(result, profile_name) => {
-            match result {
-                Ok(token) => handle_successful_login(state, token, config, event_tx, Some(profile_name)),
-                Err(e) => {
-                    tracing::warn!(
-                        "Silent login for profile '{}' failed: {}. Proceeding to interactive flow.",
-                        profile_name,
-                        e
-                    );
-                    *state = AppState::RequestingInteractiveLogin { profile_name };
-                }
+        AppEvent::ProfileSwitchSilentLoginComplete(result, profile_name) => match result {
+            Ok(token) => {
+                handle_successful_login(state, token, config, event_tx, Some(profile_name))
             }
-        }
+            Err(e) => {
+                tracing::warn!(
+                    "Silent login for profile '{}' failed: {}. Proceeding to interactive flow.",
+                    profile_name,
+                    e
+                );
+                *state = AppState::RequestingInteractiveLogin { profile_name };
+            }
+        },
         AppEvent::Auth(auth_message) => {
             handle_auth_message(state, auth_message, config, event_tx.clone());
         }
@@ -65,7 +62,10 @@ pub fn reduce(
                 match result {
                     Ok(emotes) => {
                         *global_emotes = emotes;
-                        tracing::info!("Successfully loaded {} global emotes.", global_emotes.len());
+                        tracing::info!(
+                            "Successfully loaded {} global emotes.",
+                            global_emotes.len()
+                        );
                     }
                     Err(e) => {
                         tracing::error!("Failed to load global emotes: {}", e);
@@ -76,9 +76,29 @@ pub fn reduce(
     }
 }
 
-fn handle_config_loaded(result: Result<Config, eyre::Report>, config: &mut Config) {
-    if let Ok(loaded_config) = result {
-        *config = loaded_config;
+fn handle_config_loaded(
+    result: Result<Config, eyre::Report>,
+    state: &mut AppState,
+    config: &mut Config,
+) {
+    match result {
+        Ok(loaded_config) => {
+            *config = loaded_config;
+            *state = AppState::Initializing {
+                task_spawned: false,
+            };
+        }
+        Err(e) => {
+            tracing::error!("Failed to load config: {}", e);
+            // If config fails to load, we can't do anything else.
+            // Go to first time setup.
+            *state = AppState::FirstTimeSetup {
+                client_id_input: String::new(),
+                client_secret_input: String::new(),
+                profile_name_input: String::new(),
+                error: Some(format!("Failed to load config: {}", e)),
+            };
+        }
     }
 }
 
@@ -103,8 +123,12 @@ fn handle_silent_login_complete(
                     error: None,
                 };
             } else {
-                tracing::info!("Profiles found. Proceeding to profile selection.");
-                *state = AppState::ProfileSelection { error: None };
+                tracing::info!(
+                    "Profiles found, but silent login failed. Proceeding to logged out state."
+                );
+                *state = AppState::LoggedOut {
+                    show_profile_manager_on_entry: true,
+                };
             }
         }
     }

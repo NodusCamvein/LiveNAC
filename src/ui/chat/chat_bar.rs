@@ -18,8 +18,10 @@ pub fn draw_chat_bar(
     {
         ui.scope(|ui| {
             let new_font_size = ui.style().text_styles[&egui::TextStyle::Body].size * 1.25;
-            ui.style_mut().override_font_id =
-                Some(egui::FontId::new(new_font_size, egui::FontFamily::Proportional));
+            ui.style_mut().override_font_id = Some(egui::FontId::new(
+                new_font_size,
+                egui::FontFamily::Proportional,
+            ));
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {

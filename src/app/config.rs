@@ -79,12 +79,25 @@ pub async fn load() -> Result<Config, eyre::Report> {
         }
     }
 
+    log_config_status(&config, "Post-load");
+
     Ok(config)
+}
+
+pub fn log_config_status(config: &Config, context: &str) {
+    tracing::info!(
+        "[{}] Config Status: client_id.is_some() = {}, client_secret.is_some() = {}, active_profile = {:?}",
+        context,
+        config.client_id.is_some(),
+        config.client_secret.is_some(),
+        config.active_profile_name
+    );
 }
 
 pub async fn save(config: &Config) -> Result<(), eyre::Report> {
     let path = get_config_path()?;
     tracing::info!("Saving config to {:?}", path);
+    log_config_status(config, "Pre-save");
 
     let bytes = toml::to_string_pretty(config).context("Failed to serialize config")?;
 
